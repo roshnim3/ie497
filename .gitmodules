@@ -1,0 +1,3 @@
+[submodule "open-nic-shell"]
+	path = open-nic-shell
+	url = git@github.com:roshnim3/open-nic-shell.git
