@@ -9,7 +9,7 @@
 // values that would result from parsing the same Add Order packet used in
 // itch_swparse.c. Layout:
 //   [0] msg_type       (only low byte meaningful)
-//   [1] stock_locate
+//   [1] side           ('B'=0x42 buy, 'S'=0x53 sell)
 //   [2] timestamp_lo   (low 32 bits)
 //   [3] timestamp_hi   (high 16 bits of 48-bit field)
 //   [4] ref_num_lo
@@ -18,7 +18,7 @@
 //   [7] price
 volatile uint32_t parsed_fields[8] __attribute__((aligned(32))) = {
     0x00000041,   // msg_type
-    0x00001234,   // stock_locate
+    0x00000042,   // side = 'B'
     0x00ABCDEF,   // timestamp_lo
     0x00000000,   // timestamp_hi
     0xDEADBEEF,   // ref_num_lo

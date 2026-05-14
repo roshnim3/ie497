@@ -33,8 +33,9 @@ import ooo_types::*;
         .ECC_MODE               ("no_ecc"),
         .MEMORY_INIT_FILE       ("none"),
         // 8 entries, address 0 first:
-        //   0:msg_type 1:stock_locate 2:tslo 3:tshi 4:rnlo 5:rnhi 6:shares 7:price
-        .MEMORY_INIT_PARAM      ("00000041,00001234,00ABCDEF,00000000,DEADBEEF,00000000,000003E8,000186A0"),
+        //   0:msg_type 1:side ('B'=0x42 / 'S'=0x53) 2:tslo 3:tshi
+        //   4:rnlo 5:rnhi 6:shares 7:price
+        .MEMORY_INIT_PARAM      ("00000041,00000042,00ABCDEF,00000000,DEADBEEF,00000000,000003E8,000186A0"),
         .MEMORY_OPTIMIZATION    ("true"),
         .MEMORY_PRIMITIVE       ("block"),
         .MEMORY_SIZE            (256),       // 8 entries x 32 bits
