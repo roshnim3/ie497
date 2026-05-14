@@ -15,6 +15,7 @@
     logic        parser_we;
     logic [2:0]  parser_addr;
     logic [31:0] parser_data;
+    logic        parser_commit;
 
     logic        parser_enable;
     logic [31:0] parser_interval;   // cycles between packets
@@ -28,6 +29,7 @@
     logic        fp_we;
     logic [2:0]  fp_addr;
     logic [31:0] fp_data;
+    logic        fp_commit;
     fake_packet_parser fake_parser (
         .clk      (clk),
         .rst      (rst),
@@ -35,12 +37,14 @@
         .interval (parser_interval),
         .we       (fp_we),
         .addr     (fp_addr),
-        .data     (fp_data)
+        .data     (fp_data),
+        .commit   (fp_commit)
     );
 
-    assign parser_we   = parser_enable ? fp_we   : 1'b0;
-    assign parser_addr = parser_enable ? fp_addr : 3'b0;
-    assign parser_data = parser_enable ? fp_data : 32'b0;
+    assign parser_we     = parser_enable ? fp_we     : 1'b0;
+    assign parser_addr   = parser_enable ? fp_addr   : 3'b0;
+    assign parser_data   = parser_enable ? fp_data   : 32'b0;
+    assign parser_commit = parser_enable ? fp_commit : 1'b0;
 
     cpu dut(
         .clk            (clk),
@@ -55,9 +59,10 @@
         .bmem_rdata (mem_itf.rdata ),
         .bmem_rvalid(mem_itf.rvalid),
 
-        .parser_we   (parser_we),
-        .parser_addr (parser_addr),
-        .parser_data (parser_data)
+        .parser_we     (parser_we),
+        .parser_addr   (parser_addr),
+        .parser_data   (parser_data),
+        .parser_commit (parser_commit)
     );
 
     // ---- Latency-histogram instrumentation ----
@@ -86,7 +91,7 @@
 
     // Record parser write times (one per new packet, on the seq slot 3 write)
     always @(posedge clk) begin
-        if (!rst && fake_parser.seq_write_pulse && write_idx < LATENCY_LOG_SIZE) begin
+        if (!rst && fake_parser.commit && write_idx < LATENCY_LOG_SIZE) begin
             write_ts[write_idx] <= cycle_count;
             write_idx           <= write_idx + 1;
         end
