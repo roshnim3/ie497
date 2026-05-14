@@ -17,6 +17,13 @@ import ooo_types::*;
     input  logic              flush,
     input  fu_fetch_trade_pkt ft_pkt,
 
+    // Parser write side (Port A of the parsed-fields BRAM). Common-clock
+    // for now; would move to independent-clock CDC when wiring up the
+    // OpenNIC parser hardware. Tie off in non-streaming benchmarks.
+    input  logic              parser_we,
+    input  logic [2:0]        parser_addr,
+    input  logic [31:0]       parser_data,
+
     output cdb_mul_div_pkt    cdb_trade
 );
 
@@ -51,16 +58,16 @@ import ooo_types::*;
         .USE_MEM_INIT_MMI       (0),
         .WAKEUP_TIME            ("disable_sleep"),
         .WRITE_DATA_WIDTH_A     (32),
-        .WRITE_MODE_B           ("no_change"),
+        .WRITE_MODE_B           ("read_first"),
         .WRITE_PROTECT          (1)
     ) trade_bram_inst (
         .sleep                  (1'b0),
-        // Port A — parser write side. Tied off; populated from MEMORY_INIT_PARAM.
+        // Port A — parser write side.
         .clka                   (clk),
-        .ena                    (1'b0),
-        .wea                    (1'b0),
-        .addra                  (3'b0),
-        .dina                   (32'b0),
+        .ena                    (parser_we),
+        .wea                    (parser_we),
+        .addra                  (parser_addr),
+        .dina                   (parser_data),
         .injectsbiterra         (1'b0),
         .injectdbiterra         (1'b0),
         // Port B — CPU read side, driven by the field index.

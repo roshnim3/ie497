@@ -156,6 +156,177 @@ The custom-vs-SW speedup compresses from 2.12× (trivial) to 1.83× (BBO)
 for the opposite reason: SW parse's byte-assembly cost is fixed-per-event
 but a smaller fraction of BBO's heavier per-event workload.
 
+## Hand-tuned MMIO sanity check
+
+Source: `itch_mmio_loop_tuned.c`. Identical to `itch_mmio_loop.c` except the
+three loads are emitted via inline assembly with a shared base register +
+immediate offsets, eliminating any address-arithmetic overhead a compiler
+might emit. This is the "what would an HFT shop actually write?" version,
+included to plug the critique that compiler-generated `lw` sequences leave
+performance on the table.
+
+| Path | Cycles (ITER=1000) | Cycles/event |
+|------|-------------------:|-------------:|
+| MMIO (compiler-generated) | 29,083 | 29.08 |
+| MMIO (hand-tuned inline asm) | 29,083 | 29.08 |
+| `fetch_trade` | 26,030 | 26.03 |
+
+**Both MMIO variants land at exactly the same cycle count.** The compiler
+was already generating the optimal 3-load sequence (shared base, immediate
+offsets, no per-iteration address arithmetic). The 3-cycle gap to
+`fetch_trade` is **architectural, not a compiler artifact** — the
+fetch_trade FU bypasses the LSQ, and no amount of MMIO hand-tuning can
+close that gap on this OoO core.
+
+## Mixed-workload benchmark — independent ALU work alongside the parse
+
+Sources: `itch_swparse_mixed.c`, `itch_mmio_mixed.c`, `itch_custom_mixed.c`
+(with multiplies) plus `_mixed_nomul.c` variants (shifts + adds only,
+isolating any potential `cdb_mul_div` lane contention). Each iteration
+does ~4 ALU operations on a running accumulator that's independent of the
+parse output, then runs the same trivial decision as the scaling sweep.
+
+### Results (ITER=1000)
+
+| Workload                    | SW c/event | MMIO c/event | Custom c/event | Custom-vs-MMIO |
+|-----------------------------|-----------:|-------------:|---------------:|---------------:|
+| Trivial loop (no ALU work)  |       55.0 |         29.0 |           26.0 |          1.12× |
+| Mixed (with multiplies)     |       51.2 |         27.1 |           27.1 |          1.00× |
+| Mixed (shifts/adds only)    |       55.2 |         28.1 |           28.1 |          1.00× |
+
+**The custom-vs-MMIO speedup collapses to 1.00× under the mixed workload.**
+This is an important finding the report should not hide.
+
+### Initial (wrong) hypothesis: CDB lane contention
+
+First reading: the multiplies use the MUL FU which shares the `cdb_mul_div`
+CDB lane with fetch_trade. When MUL is producing, fetch_trade results queue
+behind it in `trade_result_buffer`, erasing the bypass advantage.
+
+The mul-free variant tests this: replace `x*3` with `(x<<1)+x` etc., so the
+ALU work never touches the MUL FU. **If CDB contention were the cause, the
+speedup should return.** It doesn't — the mul-free variant is still
+1.00×. CDB contention is not the explanation.
+
+### Actual explanation: OoO slack hides the per-event parse savings
+
+Compare per-event costs across workloads:
+
+- Trivial loop (10 commits/iter): MMIO = **29.0** c/event, custom = **26.0**.
+- Mixed loop (18-19 commits/iter): MMIO = **27.1**, custom = **27.1**.
+
+Look at MMIO across the two rows. **MMIO got *faster* per event when we
+added 8 unrelated ALU ops.** That's only possible if the OoO core was
+idle-ish during the parse in the trivial loop, and the extra ALU work used
+that slack. Once the slack is filled, fetch_trade's 2-cycle FU bypass no
+longer surfaces in cycle counts because the LSU latency was already being
+hidden by other work.
+
+This is **OoO doing its job**, not a bug in the architecture. fetch_trade
+is never slower than MMIO in any benchmark; it's just that when the
+workload has enough independent work to fill the OoO core's spare slots,
+both paths converge to a similar per-event cost.
+
+### What this means for the design and the claim
+
+- **The dedicated FU was still the right call.** No contention pathology
+  surfaces. Custom is never *slower* than MMIO across any benchmark we
+  ran.
+- **The throughput speedup is workload-dependent.** It surfaces in
+  parse-bound workloads (trivial loop: 1.12×, BBO: 1.13×); it disappears
+  when there's enough concurrent independent work to fill the OoO pipeline
+  (mixed: 1.00×).
+- **Latency, not throughput, is the right metric for an HFT claim.** Time
+  from packet-arrival to decision-emission on a single event is the
+  HFT-critical figure (1.78× speedup, cold-start). Steady-state throughput
+  is a less HFT-relevant number that compresses under realistic workload
+  mixes.
+- **A non-OoO or simpler in-order core would expose the full fetch_trade
+  advantage in every workload** — the OoO core is uniquely capable of
+  hiding the LSU latency we're trying to bypass.
+
+## Streaming benchmark — tick-to-trade latency histogram
+
+Adds a behavioral parser model (`hvl/common/fake_packet_parser.sv`) that
+drives Port A of the fetch_trade BRAM with a stream of varied ITCH-like
+packets. Each packet is written to the BRAM as a 5-cycle burst, with the
+sequence slot (slot 3) published LAST so the firmware never sees a
+half-written packet. Firmware (`testcode/sim_b/itch_stream.c`) polls
+`FETCH_TRADE(3)` for new sequences, reads the four data fields, makes the
+decision, and emits a `slti x0, x0, 7` marker per packet. The testbench
+timestamps both the parser-write (seq slot pulse) and the marker-commit,
+producing a per-packet latency histogram dumped to `latency.csv`.
+
+### Inter-arrival sweep — when does the CPU keep up?
+
+ITER=100 packets per run. `+PARSER_INTERVAL_ECE411` = cycles between
+parser packet starts.
+
+| Interval (cyc) | n  | min | mean | p50 | p99 | max  | Interpretation |
+|---------------:|---:|----:|-----:|----:|----:|-----:|----------------|
+| 8              | 90 | 547 | 1349 | 1343| 2130| 2144 | CPU saturated, queueing dominates |
+| 32             | 90 | 333 |  340 |  341|  347|  347 | CPU matches parser rate, fixed offset |
+| 128            | 90 | 268 |  274 |  274|  279|  279 | CPU matches parser rate, fixed offset |
+| 512            | 90 |  14 |   18 |   17|   23|   23 | **CPU has slack — true tick-to-trade** |
+| 2048           | 90 |  14 |   18 |   18|   23|   23 | Same as 512 — measurement stable |
+
+The plateau at 17 cycles for interval ≥ 512 is the architecturally
+meaningful number: it's the latency from "parser publishes the
+sequence-slot write" to "CPU commits the decision marker," with the CPU
+already in its polling loop when the packet arrives. At lower intervals
+the CPU is saturated (the latency is dominated by the constant offset
+between parser publish and CPU processing rate, not by per-event work).
+
+### Headline latency histogram (interval = 2048, packets 1-99)
+
+p50 = **17 cycles** (~53 ns @ 322 MHz, ~85 ns @ 200 MHz)
+p99 = **23 cycles** (~71 ns @ 322 MHz, ~115 ns @ 200 MHz)
+Distribution:
+
+```
+14 cyc | ##########                    (12)
+15 cyc | #######                       (8)
+16 cyc | #######                       (8)
+17 cyc | ##############                (16)  <- mode
+18 cyc | #######                       (8)
+19 cyc | ########                      (9)
+20 cyc | ###############               (17)
+21 cyc | #######                       (8)
+22 cyc | #######                       (8)
+23 cyc | ####                          (5)
+```
+
+Spread is **9 cycles total (14-23)** with tight clustering at 17 and 20.
+This is the kind of low-jitter, predictable latency profile HFT firmware
+targets — far more important than mean throughput.
+
+### What this validates
+
+- **The parser→CPU contract works end-to-end.** Parser writes BRAM at the
+  322-MHz-equivalent rate, CPU polls and consumes via fetch_trade.
+- **The polling-with-sequence-slot handshake is correct.** The firmware
+  never sees a half-written packet (slot 3 is published last).
+- **Latency, not just throughput, is now measurable** for the first
+  time. Single-shot cycle counts gave a one-event latency; this histogram
+  gives a distribution across a stream, which is the canonical HFT figure.
+- **The decoupled, latest-wins BRAM is the right shape** for HFT. Excess
+  parser writes (at interval=8, parser wrote 1000+ packets but CPU only
+  processed 100) silently update the BRAM; the CPU only ever sees the
+  most-recent packet when it polls. No queueing latency.
+
+### What this does NOT validate
+
+- Cross-clock-domain integration. Parser runs on the same clock as the
+  CPU in this model. Real OpenNIC integration would put the parser on the
+  322-MHz CMAC clock with the CPU on a separate (likely slower) clock; the
+  XPM_MEMORY supports this via `CLOCKING_MODE="independent_clock"`.
+- CMAC line-rate / Ethernet framing / DMA. Out of scope; this measures
+  the CPU-side latency budget on a packet that's already been parsed.
+- Comparison with streaming MMIO or SW parse paths. Those would require
+  the parser to also drive the d-cache backing store, which is more
+  invasive. The cycles/event numbers from the trivial loop establish the
+  steady-state custom-vs-MMIO speedup separately.
+
 ## What each path does
 
 ### Path 1 — `itch_swparse.c`

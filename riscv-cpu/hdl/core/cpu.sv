@@ -12,7 +12,14 @@ import ooo_types::*;
 
     input   logic   [31:0]      bmem_raddr,
     input   logic   [63:0]      bmem_rdata,
-    input   logic               bmem_rvalid
+    input   logic               bmem_rvalid,
+
+    // Parser write port for the fetch_trade BRAM. Drive these from a
+    // behavioral parser model (or the OpenNIC parser hardware) to stream
+    // packets into the CPU. Tie to 0 for non-streaming benchmarks.
+    input   logic               parser_we,
+    input   logic   [2:0]       parser_addr,
+    input   logic   [31:0]      parser_data
 );
 
     // RVFI packet
@@ -471,11 +478,14 @@ import ooo_types::*;
     );
 
     fetch_trade fetch_trade_unit (
-        .clk        (clk),
-        .rst        (rst),
-        .flush      ((|flush)),
-        .ft_pkt     (ft_pkt),
-        .cdb_trade  (cdb_trade)
+        .clk         (clk),
+        .rst         (rst),
+        .flush       ((|flush)),
+        .ft_pkt      (ft_pkt),
+        .parser_we   (parser_we),
+        .parser_addr (parser_addr),
+        .parser_data (parser_data),
+        .cdb_trade   (cdb_trade)
     );
 
     always_comb begin
