@@ -131,12 +131,14 @@ import ooo_types::*;
     logic           rs_mul_full, rs_mul_empty;
     logic           rs_div_full, rs_div_empty;
     logic           rs_mem_full, rs_mem_empty;
+    logic           rs_ft_full,  rs_ft_empty;
 
-    rs_br_entry_t   rs_br_enq;
-    rs_alu_entry_t  rs_alu_enq;
-    rs_mul_entry_t  rs_mul_enq;
-    rs_div_entry_t  rs_div_enq;
-    rs_mem_entry_t  rs_mem_enq;
+    rs_br_entry_t           rs_br_enq;
+    rs_alu_entry_t          rs_alu_enq;
+    rs_mul_entry_t          rs_mul_enq;
+    rs_div_entry_t          rs_div_enq;
+    rs_mem_entry_t          rs_mem_enq;
+    rs_fetch_trade_entry_t  rs_ft_enq;
     
     // LSQ signals
     logic           lsq_full, lsq_empty;
@@ -156,6 +158,8 @@ import ooo_types::*;
 
     rs_mem_entry_t  rs_mem_ready_entry;
 
+    rs_fetch_trade_entry_t  rs_ft_ready_entry;
+
     cdb_br_pkt      cdb_br;
     cdb_alu_pkt     cdb_alu, cdb_alu_latched;
     cdb_alu_br_pkt  cdb_alu_br;
@@ -165,6 +169,10 @@ import ooo_types::*;
     cdb_mul_div_pkt cdb_mul_buf_dout;
     logic           cdb_mul_buf_enq, cdb_mul_buf_deq;
     logic           cdb_mul_buf_full, cdb_mul_buf_empty;
+    cdb_mul_div_pkt cdb_trade;                  // fetch_trade FU output, shares mul/div lane
+    cdb_mul_div_pkt cdb_trade_buf_dout;
+    logic           cdb_trade_buf_enq, cdb_trade_buf_deq;
+    logic           cdb_trade_buf_full, cdb_trade_buf_empty;
     cdb_mem_pkt     cdb_mem;
 
     // Simplified wakeup packets for RS (only valid and rd_paddr)
@@ -203,6 +211,8 @@ import ooo_types::*;
     logic [31:0]    mem_pr1_data, mem_pr2_data;
     fu_mem_pkt      mem_pkt;
     logic           fu_mem_ready;
+
+    fu_fetch_trade_pkt ft_pkt;
 
     // Memory address/data calculation signals
     logic           addr_data_valid;
@@ -337,9 +347,31 @@ import ooo_types::*;
         .empty  (cdb_mul_buf_empty)
     );
 
-    // MUL/DIV CDB arbiter
+    // fetch_trade buffers behind mul on the same CDB lane. In HFT workload
+    // mul/div are idle, so trade never hits the buffer; the queue is here for
+    // correctness in mixed workloads.
+    assign cdb_trade_buf_enq = cdb_trade.valid &&
+                               (cdb_div.valid || !cdb_mul_buf_empty || cdb_mul.valid || !cdb_trade_buf_empty);
+    assign cdb_trade_buf_deq = !cdb_div.valid && cdb_mul_buf_empty &&
+                               !cdb_mul.valid && !cdb_trade_buf_empty;
+
+    queue #(
+        .DATA_WIDTH($bits(cdb_mul_div_pkt)),
+        .QUEUE_SIZE(4)
+    ) trade_result_buffer (
+        .clk    (clk),
+        .rst    (rst),
+        .flush  ((|flush)),
+        .enq    (cdb_trade_buf_enq && !cdb_trade_buf_full),
+        .deq    (cdb_trade_buf_deq),
+        .din    (cdb_trade),
+        .dout   (cdb_trade_buf_dout),
+        .full   (cdb_trade_buf_full),
+        .empty  (cdb_trade_buf_empty)
+    );
+
+    // MUL/DIV/TRADE CDB arbiter — DIV > mul_buf > MUL > trade_buf > TRADE
     always_comb begin
-        // Priority to DIV unit
         if (cdb_div.valid) begin
             cdb_mul_div = cdb_div;
         end
@@ -348,6 +380,12 @@ import ooo_types::*;
         end
         else if (cdb_mul.valid) begin
             cdb_mul_div = cdb_mul;
+        end
+        else if (!cdb_trade_buf_empty) begin
+            cdb_mul_div = cdb_trade_buf_dout;
+        end
+        else if (cdb_trade.valid) begin
+            cdb_mul_div = cdb_trade;
         end
         else begin
             cdb_mul_div = '0;
@@ -431,6 +469,26 @@ import ooo_types::*;
         .alu_pkt    (alu_pkt),
         .cdb_alu    (cdb_alu)
     );
+
+    fetch_trade fetch_trade_unit (
+        .clk        (clk),
+        .rst        (rst),
+        .flush      ((|flush)),
+        .ft_pkt     (ft_pkt),
+        .cdb_trade  (cdb_trade)
+    );
+
+    always_comb begin
+        if (rs_ft_ready_entry.valid) begin
+            ft_pkt.valid     = 1'b1;
+            ft_pkt.field_idx = rs_ft_ready_entry.field_idx;
+            ft_pkt.rd_paddr  = rs_ft_ready_entry.rd_paddr;
+            ft_pkt.rd_addr   = rs_ft_ready_entry.rd_addr;
+            ft_pkt.rob_index = rs_ft_ready_entry.rob_index;
+        end else begin
+            ft_pkt = '0;
+        end
+    end
 
     always_comb begin
         if (rs_alu_ready_entry.valid & rs_alu_ready_entry.rs1_ready & rs_alu_ready_entry.rs2_ready) begin
@@ -651,6 +709,20 @@ import ooo_types::*;
         .rs_ready_entry     (rs_mem_ready_entry)
     );
 
+    fetch_trade_rs #(
+        .RS_SIZE       (FT_RS_SIZE)
+    )
+    fetch_trade_res_station (
+        .clk            (clk),
+        .rst            (rst),
+        .flush          ((|flush)),
+        .new_entry      (rs_ft_enq),
+
+        .rs_full        (rs_ft_full),
+        .rs_empty       (rs_ft_empty),
+        .rs_ready_entry (rs_ft_ready_entry)
+    );
+
     // Combine RS and LSQ full signals for memory operations
     // Memory operations need space in BOTH the reservation station AND the LSQ
     logic rs_mem_or_lsq_full;
@@ -671,7 +743,8 @@ import ooo_types::*;
         .rs_mul_full            (rs_mul_full),
         .rs_div_full            (rs_div_full),
         .rs_mem_full            (rs_mem_or_lsq_full),  // Combined RS+LSQ full signal
-        
+        .rs_ft_full             (rs_ft_full),
+
         // LSQ index for mem operations
         .next_lsq_index         (next_lsq_index),
 
@@ -681,6 +754,7 @@ import ooo_types::*;
         .rs_mul_enq             (rs_mul_enq),
         .rs_div_enq             (rs_div_enq),
         .rs_mem_enq             (rs_mem_enq),
+        .rs_ft_enq              (rs_ft_enq),
 
         .rs_full                (rs_full)
     );

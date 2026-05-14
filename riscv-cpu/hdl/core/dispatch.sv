@@ -15,18 +15,20 @@ import ooo_types::*;
     input  logic            rs_mul_full,
     input  logic            rs_div_full,
     input  logic            rs_mem_full,
-    
+    input  logic            rs_ft_full,
+
     // LSQ index for mem operations
     input  logic [$clog2(LSQ_SIZE)-1:0] next_lsq_index,
 
     output logic            rs_full,
 
     // RS enqueue signals
-    output rs_br_entry_t    rs_br_enq,
-    output rs_alu_entry_t   rs_alu_enq,
-    output rs_mul_entry_t   rs_mul_enq,
-    output rs_div_entry_t   rs_div_enq,
-    output rs_mem_entry_t   rs_mem_enq
+    output rs_br_entry_t            rs_br_enq,
+    output rs_alu_entry_t           rs_alu_enq,
+    output rs_mul_entry_t           rs_mul_enq,
+    output rs_div_entry_t           rs_div_enq,
+    output rs_mem_entry_t           rs_mem_enq,
+    output rs_fetch_trade_entry_t   rs_ft_enq
 );
 
     // Helper signals for CDB bypass detection
@@ -46,7 +48,8 @@ import ooo_types::*;
         rs_mul_enq = '0;
         rs_div_enq = '0;
         rs_mem_enq = '0;
-        
+        rs_ft_enq  = '0;
+
         // Don't dispatch if flush is active (pipeline is being flushed)
         if(rename_pkt.valid && !flush && !rob_full) begin        
             unique case (rename_pkt.fu_flag)
@@ -118,6 +121,13 @@ import ooo_types::*;
                     rs_mem_enq.rob_index   = rename_pkt.rob_index;
                     rs_mem_enq.lsq_index   = next_lsq_index;  // Physical LSQ index for direct update
                 end
+                FU_FETCH_TRADE: begin
+                    rs_ft_enq.valid        = 1'b1;
+                    rs_ft_enq.field_idx    = rename_pkt.imm[2:0];
+                    rs_ft_enq.rd_paddr     = rename_pkt.rd_paddr;
+                    rs_ft_enq.rd_addr     = rename_pkt.rd_addr;
+                    rs_ft_enq.rob_index    = rename_pkt.rob_index;
+                end
                 default: begin
                     // Default case already handled by initial assignments
                 end
@@ -127,11 +137,12 @@ import ooo_types::*;
 
     always_comb begin
         unique case (rename_pkt.fu_flag)
-            FU_BR:   rs_full = rs_br_full;
-            FU_ALU:  rs_full = rs_alu_full;
-            FU_MUL:  rs_full = rs_mul_full;
-            FU_DIV:  rs_full = rs_div_full;
-            FU_MEM:  rs_full = rs_mem_full;
+            FU_BR:           rs_full = rs_br_full;
+            FU_ALU:          rs_full = rs_alu_full;
+            FU_MUL:          rs_full = rs_mul_full;
+            FU_DIV:          rs_full = rs_div_full;
+            FU_MEM:          rs_full = rs_mem_full;
+            FU_FETCH_TRADE:  rs_full = rs_ft_full;
             default:
                 rs_full = 1'b0;
         endcase

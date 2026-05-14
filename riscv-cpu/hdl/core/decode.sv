@@ -220,6 +220,16 @@ import ooo_types::*;
                     endcase
                 end
             end
+            // custom-1: fetch_trade rd, imm[2:0] (I-type)
+            // Reads parser_output_bram[imm[2:0]] via the dedicated fetch_trade FU.
+            // Encoded with opcode=0101011, funct3=0; immediate selects the field.
+            op_custom1: begin
+                decode_packet_next.rd_addr      = inst.i_type.rd;
+                decode_packet_next.rs1_addr     = '0;          // x0 — no operand
+                decode_packet_next.imm          = i_imm;       // field index in low bits
+                decode_packet_next.fu_flag      = FU_FETCH_TRADE;
+            end
+
             default: begin
                 // NOP or unsupported instruction
                 decode_packet_next = '0;  // Mark as invalid

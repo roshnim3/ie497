@@ -8,6 +8,7 @@ package ooo_types;
     localparam DIV_RS_SIZE  = 4;  // Keep DIV_RS_SIZE as power of 2
     localparam BR_RS_SIZE   = 8;  // Keep BR_RS_SIZE as power of 2
     localparam MEM_RS_SIZE  = 16; // Keep MEM_RS_SIZE as power of 2
+    localparam FT_RS_SIZE   = 4;  // fetch_trade RS depth (power of 2)
     localparam LSQ_SIZE     = 8;  // Keep LSQ_SIZE as power of 2
     localparam FETCH_Q_SIZE = 8;  // Keep FETCH_QUEUE_SIZE as power of 2
 
@@ -57,7 +58,8 @@ package ooo_types;
         op_load      = 7'b0000011, // load (I type)
         op_store     = 7'b0100011, // store (S type)
         op_imm       = 7'b0010011, // arith ops with register/imemediate operands (I type)
-        op_reg       = 7'b0110011  // arith ops with register operands (R type)
+        op_reg       = 7'b0110011, // arith ops with register operands (R type)
+        op_custom1   = 7'b0101011  // fetch_trade rd, imm[2:0] (I type, FU_FETCH_TRADE)
     } rv32i_opcode;
 
     // Branch funct3 codes
@@ -175,12 +177,13 @@ package ooo_types;
     } div_state_t;
 
     // Functional Unit flags, for identifying which FU's queue to send to
-    typedef enum logic [2:0] { 
-        FU_ALU      = 3'b000,
-        FU_BR       = 3'b001,
-        FU_MEM      = 3'b010,
-        FU_MUL      = 3'b100,
-        FU_DIV      = 3'b101
+    typedef enum logic [2:0] {
+        FU_ALU         = 3'b000,
+        FU_BR          = 3'b001,
+        FU_MEM         = 3'b010,
+        FU_FETCH_TRADE = 3'b011, // custom-1: BRAM-backed parsed-field read
+        FU_MUL         = 3'b100,
+        FU_DIV         = 3'b101
     } fu_flags;
 
     // Register Alias Table and Retirement Register Alias Table entry
@@ -416,6 +419,26 @@ package ooo_types;
         logic [31:0]   rs1_val;
         logic [31:0]   rs2_val;
     } cdb_alu_pkt;
+
+    // fetch_trade RS entry. Custom-1 has no source operands (rs1=x0, no rs2),
+    // so the wakeup machinery is vestigial — rs*_ready are forced high at dispatch.
+    typedef struct packed {
+        logic          valid;
+        logic [2:0]    field_idx;       // BRAM read address (from imm[2:0])
+        logic [5:0]    rd_paddr;
+        logic [4:0]    rd_addr;
+        logic [$clog2(ROB_SIZE)-1:0] rob_index;
+    } rs_fetch_trade_entry_t;
+
+    // fetch_trade FU input. field_idx selects which parser-output BRAM entry
+    // to return; the FU emits cdb_mul_div_pkt to share the mul/div CDB lane.
+    typedef struct packed {
+        logic          valid;
+        logic [2:0]    field_idx;
+        logic [5:0]    rd_paddr;
+        logic [4:0]    rd_addr;
+        logic [$clog2(ROB_SIZE)-1:0] rob_index;
+    } fu_fetch_trade_pkt;
 
     typedef struct packed {
         logic           valid;
