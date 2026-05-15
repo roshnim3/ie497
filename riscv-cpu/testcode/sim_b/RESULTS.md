@@ -449,3 +449,54 @@ through the existing CDB infrastructure by sharing the mul/div lane.
   reach the segment, the d-cache has already been touched by stack
   operations, so path 2's three loads largely hit. The 46-cycle delta is
   pipeline / LSQ latency, not cold-miss penalty.
+
+## Phase 1 TX primitive (custom-2 `pkt_w` / `pkt_s`)
+
+A symmetric TX primitive lives behind opcode `0x5b`: `pkt_w rs1, off`
+writes a 32-bit payload word to a 16x32 BRAM-backed buffer (Port A); `pkt_s
+rs1` kicks a state machine that drains the buffer onto an AXI-Stream
+master, one beat per cycle, with `tkeep` reflecting the trailing-octet
+count from the rs1-supplied length. The testbench `fake_packet_sink`
+captures every beat to `tx_packets.csv`. For a 64-octet send (16 PKT_W +
+PKT_S(64)) the in-FU latency from issue to `tlast` is **16 cycles** —
+fully pipelined, one BRAM read overlapping each emit. Phase 1 is
+fire-and-forget: CDB writeback fires the cycle after issue, the RS stalls
+new pkt_w/pkt_s until the FSM is idle, and the FSM survives flushes
+(octets on the wire can't be rolled back, so the FU is treated like
+fetch_trade's "pop at issue" — safe in practice because pkt_s only issues
+once rs1/length is resolved). RX-side regression: `itch_stream.c` with
+`PARSER_INTERVAL=512` matches the saved baseline byte-for-byte (N=100,
+min=11, p50=31, p99=36).
+
+## Phase 2 TX primitive — multi-buffer
+
+Phase 2 widens the TX BRAM to 8 packets x 16 words x 32b (128 entries,
+one BRAM18) and treats the slots as a FIFO with `staging_ptr` (CPU
+producer) and `send_ptr` (HW consumer). Per-slot length is captured at
+pkt_s in a small `pkt_length[8]` array. The drain FSM is decoupled from
+the FU input: it polls `staging_ptr != send_ptr` and pulls the next slot's
+length to start emission, advancing `send_ptr` after the last beat.
+Because Port A (CPU writes to `{staging_ptr, off}`) and Port B (HW reads
+from `{send_ptr, idx}`) address disjoint slots whenever the FIFO is
+non-empty-and-non-full, the CPU is free to pkt_w/pkt_s into slot K+1
+while HW is mid-drain on slot K — the RS only stalls when all 8 slots are
+queued (`fifo_full`). The 3-packet smoke test in `itch_send_multi.c`
+captures three back-to-back 64-octet packets with distinct byte patterns
+(0x10..0x4F, 0x20..0x5F, 0x30..0x6F) in order, drain latency still 16
+cycles per packet. Phase 1's `itch_send_packet.c` still passes
+unchanged — single-packet latency moves from 16 to 17 cycles (one extra
+cycle for the FIFO advance to register before the FSM picks it up).
+`itch_custom.c` regression IPC is identical to Phase 1 (0.237), and
+`itch_stream.c` RX is byte-for-byte identical to the saved
+`latency_interval_512.csv` baseline — the BRAM resize and CDB chain are
+invisible to fetch_trade.
+
+Concurrent staging-vs-send is verified by `itch_send_overlap.c`, an
+8-packet back-to-back stream (`__attribute__((always_inline))` to avoid
+the per-call fetch dip that otherwise serialises packets). A testbench
+counter increments any cycle `port_a_we && emit_valid_q` are both high,
+i.e. a CPU pkt_w to slot K+1 lands in the same clock as an FSM Port B
+read of slot K. Result: 128 writes, 128 emits, **16 overlap cycles** —
+proving the dual-port BRAM serves both sides simultaneously. All 8
+captured rows carry the expected 64-octet patterns 0x10..0x4F through
+0x80..0xBF.

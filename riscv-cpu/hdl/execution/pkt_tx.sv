@@ -1,22 +1,38 @@
-// pkt_tx FU — custom-2 instruction backend.
+// pkt_tx FU — custom-2 instruction backend, Phase 2 multi-buffer.
 //
-// Two instructions share one BRAM-backed TX buffer (16 words x 32 bits =
-// 64 octets max, one BRAM18):
+// Two instructions share a BRAM-backed TX buffer of 8 packets x 16 words x
+// 32b each (4 Kibit, one BRAM18):
 //
-//   pkt_w rs1, off   — write payload word (rs1, 32b wide) to BRAM[off]
-//   pkt_s rs1        — emit first rs1 octets of BRAM onto AXI-Stream
+//   pkt_w rs1, off   — write payload word (rs1, 32b wide) to staging slot
+//                       at word offset off (0..15)
+//   pkt_s rs1        — commit the staging slot: record length=rs1 octets
+//                       and advance staging_ptr so the drain FSM can pick
+//                       it up
 //
-// Phase 1 single-buffer behavior:
-//   - pkt_w writes BRAM port A in one cycle; CDB writeback fires the next
-//     cycle from a registered pkt_pipe.
-//   - pkt_s captures length, kicks off a state machine that issues one
-//     BRAM read per cycle and drives one AXI-Stream beat per cycle (the
-//     beat lags the read by one cycle due to READ_LATENCY_B=1). CDB
-//     writeback fires the cycle after issue — fire-and-forget; the
-//     firmware must not issue another pkt_w/pkt_s until the send drains.
-//   - pkt_tx_busy keeps the RS from issuing more work mid-send.
-//   - Testbench drives m_axis_pkt_tx_tready=1 always; we don't honor
-//     backpressure in Phase 1.
+// Multi-buffer FIFO discipline mirrors the RX fetch_trade design, inverted:
+//   - staging_ptr (CPU side, producer): the slot currently being filled.
+//     pkt_w writes BRAM Port A at {staging_ptr_low, off}. pkt_s records
+//     pkt_length[staging_ptr_low] = rs1 and bumps staging_ptr.
+//   - send_ptr (HW side, consumer): the slot the drain FSM is emitting from.
+//     The FSM is independent of the FU input; it polls staging_ptr vs
+//     send_ptr and starts a new drain whenever the FIFO is non-empty.
+//   - 4-entry pointers: MSB is the wrap flag, low 3 select the slot.
+//     fifo_empty when staging == send, fifo_full when wraps differ and
+//     low bits match (8 in-flight slots).
+//
+// Phase 2 lets the CPU pipeline a new packet (pkt_w stream into staging
+// slot K+1) while the HW is still draining slot K — Port A writes at addr
+// {K+1, off}, Port B reads at addr {K, idx}, so the dual-port BRAM serves
+// both with no conflict. The RS only stalls when the FIFO is genuinely
+// full (no remaining staging slot).
+//
+// CDB writeback for both pkt_w and pkt_s fires one cycle after issue from
+// a registered pkt_pipe. Both use rd=x0 in the firmware macros, so a stale
+// writeback (e.g., after a flush) can't corrupt the PRF. The drain FSM is
+// not flushable: once octets are on the wire they can't be rolled back.
+// Speculative-start protection mirrors fetch_trade's "pop at issue" — by
+// the cycle pkt_s reaches the FU, rs1 is resolved and the instruction is
+// effectively on the resolved path.
 
 module pkt_tx
 import ooo_types::*;
@@ -26,7 +42,7 @@ import ooo_types::*;
     input  logic              flush,
     input  fu_pkt_tx_pkt      pkt,
 
-    output logic              pkt_tx_busy,
+    output logic              pkt_tx_busy,    // FIFO full — RS must stall
 
     // AXI-Stream master to the sink (testbench or CMAC adapter)
     output logic              m_axis_tvalid,
@@ -38,25 +54,44 @@ import ooo_types::*;
     output cdb_mul_div_pkt    cdb_pkt_tx
 );
 
-    // The flush port is intentionally ignored: the FSM is an externally
-    // visible side effect (octets on the wire) so it cannot be rolled back,
-    // and pkt_pipe stays put because pkt_w/pkt_s use rd=x0 so a stale
-    // writeback can't corrupt the PRF. Reference flush here to keep the
-    // signal in the netlist and suppress the unused-input lint warning.
+    // The flush port is intentionally ignored: the drain FSM is an externally
+    // visible side effect (octets on the wire), and pkt_pipe stays put
+    // because pkt_w/pkt_s use rd=x0 so a stale writeback can't corrupt the
+    // PRF. Reference flush in a dummy signal to keep it in the netlist and
+    // silence the unused-input lint.
     logic _unused_flush;
     assign _unused_flush = flush;
 
+    // ---- FIFO pointers ----
+    localparam BUF_DEPTH      = 8;
+    localparam BUF_DEPTH_BITS = 3;   // log2(BUF_DEPTH)
+
+    // 4 entries wide: MSB is wrap, low 3 select the slot.
+    logic [BUF_DEPTH_BITS:0] staging_ptr;
+    logic [BUF_DEPTH_BITS:0] send_ptr;
+
+    logic fifo_empty;
+    logic fifo_full;
+    assign fifo_empty = (staging_ptr == send_ptr);
+    assign fifo_full  = (staging_ptr[BUF_DEPTH_BITS] != send_ptr[BUF_DEPTH_BITS]) &&
+                        (staging_ptr[BUF_DEPTH_BITS-1:0] == send_ptr[BUF_DEPTH_BITS-1:0]);
+
+    // Per-slot length (in octets) recorded by pkt_s, consumed by the FSM
+    // when it starts draining a slot. Small distributed-RAM array.
+    logic [6:0] pkt_length [BUF_DEPTH];
+
     // ---- TX buffer BRAM ----
-    // Dual-port: port A for pkt_w writes, port B for the send-FSM reads.
+    // Dual-port: Port A for pkt_w writes (staging_ptr_low | word_offset),
+    // Port B for the drain FSM (send_ptr_low | issue_idx).
     logic [31:0] bram_doutb;
     logic        port_a_we;
-    logic [3:0]  port_a_addr;
+    logic [6:0]  port_a_addr;
     logic [31:0] port_a_data;
-    logic [3:0]  read_addr_b;
+    logic [6:0]  read_addr_b;
 
     xpm_memory_sdpram #(
-        .ADDR_WIDTH_A           (4),
-        .ADDR_WIDTH_B           (4),
+        .ADDR_WIDTH_A           (7),
+        .ADDR_WIDTH_B           (7),
         .AUTO_SLEEP_TIME        (0),
         .BYTE_WRITE_WIDTH_A     (32),
         .CASCADE_HEIGHT         (0),
@@ -66,7 +101,7 @@ import ooo_types::*;
         .MEMORY_INIT_PARAM      ("0"),
         .MEMORY_OPTIMIZATION    ("true"),
         .MEMORY_PRIMITIVE       ("block"),
-        .MEMORY_SIZE            (512),      // 16 entries x 32 bits
+        .MEMORY_SIZE            (4096),     // 128 entries x 32 bits
         .MESSAGE_CONTROL        (0),
         .READ_DATA_WIDTH_B      (32),
         .READ_LATENCY_B         (1),
@@ -100,59 +135,76 @@ import ooo_types::*;
         .dbiterrb               ()
     );
 
-    // ---- FSM ----
-    typedef enum logic [0:0] { TX_IDLE = 1'b0, TX_SEND = 1'b1 } tx_state_t;
-
-    tx_state_t  state, state_n;
-    logic [3:0] issue_idx, issue_idx_n;       // next BRAM port-B addr to drive
-    logic [3:0] emit_idx,  emit_idx_n;        // index of the beat being driven this cycle
-    logic [3:0] total_words, total_words_n;   // ceil(length_bytes / 4)
-    logic [1:0] last_byte_cnt, last_byte_cnt_n;
-    logic       emit_valid_q, emit_valid_n;   // 1 if this cycle drives a beat
-
-    // Issue qualifiers (combinational, from the live pkt input)
+    // ---- CPU-side: pkt_w / pkt_s acceptance ----
+    // The RS stalls when fifo_full, so pkt.valid && !fifo_full means the
+    // entry is genuinely landing in this slot.
     logic issue_pkt;
     logic issue_send;
     logic issue_write;
-    assign issue_pkt   = pkt.valid && (state == TX_IDLE);
+    assign issue_pkt   = pkt.valid && !fifo_full;
     assign issue_send  = issue_pkt &&  pkt.is_send;
     assign issue_write = issue_pkt && !pkt.is_send;
 
-    // Length decoding for pkt_s
-    logic [3:0] total_words_calc;
-    logic [1:0] last_byte_cnt_calc;
-    // For lengths 0..64 bytes; data[5:0] covers up to 63, data[6:0] up to 127.
-    // We only care about the low 6 bits since the BRAM is 64B.
-    assign total_words_calc   = (pkt.data[1:0] == 2'd0) ? pkt.data[5:2]
-                                                       : (pkt.data[5:2] + 4'd1);
-    assign last_byte_cnt_calc = pkt.data[1:0];
-
-    // BRAM Port A write (combinational from pkt)
+    // BRAM Port A write — combinational from pkt; addr selects staging slot.
     assign port_a_we   = issue_write;
-    assign port_a_addr = pkt.word_offset;
+    assign port_a_addr = {staging_ptr[BUF_DEPTH_BITS-1:0], pkt.word_offset};
     assign port_a_data = pkt.data;
 
-    // BRAM Port B read address
-    always_comb begin
-        if (state == TX_IDLE && issue_send) read_addr_b = 4'd0;
-        else if (state == TX_SEND)          read_addr_b = issue_idx;
-        else                                read_addr_b = 4'd0;
+    // Record per-slot length on pkt_s and advance staging_ptr.
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            staging_ptr <= '0;
+            for (integer unsigned i = 0; i < BUF_DEPTH; i++)
+                pkt_length[i] <= '0;
+        end else if (issue_send) begin
+            pkt_length[staging_ptr[BUF_DEPTH_BITS-1:0]] <= pkt.data[6:0];
+            staging_ptr <= staging_ptr + 1'b1;
+        end
     end
 
-    // ---- FSM next-state logic ----
+    // ---- HW drain FSM ----
+    typedef enum logic [0:0] { TX_IDLE = 1'b0, TX_SEND = 1'b1 } tx_state_t;
+
+    tx_state_t  state, state_n;
+    logic [3:0] issue_idx, issue_idx_n;       // next BRAM word index to read
+    logic [3:0] emit_idx,  emit_idx_n;        // index of the beat driven this cycle
+    logic [3:0] total_words, total_words_n;   // ceil(length_octets / 4)
+    logic [1:0] last_byte_cnt, last_byte_cnt_n;
+    logic       emit_valid_q, emit_valid_n;
+
+    // Length decoding for the slot being picked up at IDLE->SEND.
+    logic [6:0] start_length;
+    logic [3:0] start_total_words;
+    logic [1:0] start_last_byte_cnt;
+    assign start_length        = pkt_length[send_ptr[BUF_DEPTH_BITS-1:0]];
+    assign start_total_words   = (start_length[1:0] == 2'd0) ? start_length[5:2]
+                                                             : (start_length[5:2] + 4'd1);
+    assign start_last_byte_cnt = start_length[1:0];
+
+    // BRAM Port B read address — uses send_ptr's slot.
     always_comb begin
-        state_n         = state;
-        issue_idx_n     = issue_idx;
-        emit_idx_n      = emit_idx;
-        total_words_n   = total_words;
-        last_byte_cnt_n = last_byte_cnt;
-        emit_valid_n    = 1'b0;
+        if (state == TX_IDLE && !fifo_empty) read_addr_b = {send_ptr[BUF_DEPTH_BITS-1:0], 4'd0};
+        else if (state == TX_SEND)           read_addr_b = {send_ptr[BUF_DEPTH_BITS-1:0], issue_idx};
+        else                                 read_addr_b = '0;
+    end
+
+    // FSM next-state logic. send_ptr only advances when the FSM finishes a
+    // drain, so its update is folded into the always_ff below.
+    logic send_ptr_advance;
+    always_comb begin
+        state_n          = state;
+        issue_idx_n      = issue_idx;
+        emit_idx_n       = emit_idx;
+        total_words_n    = total_words;
+        last_byte_cnt_n  = last_byte_cnt;
+        emit_valid_n     = 1'b0;
+        send_ptr_advance = 1'b0;
 
         unique case (state)
             TX_IDLE: begin
-                if (issue_send) begin
-                    total_words_n   = total_words_calc;
-                    last_byte_cnt_n = last_byte_cnt_calc;
+                if (!fifo_empty) begin
+                    total_words_n   = start_total_words;
+                    last_byte_cnt_n = start_last_byte_cnt;
                     issue_idx_n     = 4'd1;
                     emit_idx_n      = 4'd0;
                     emit_valid_n    = 1'b1;
@@ -160,14 +212,12 @@ import ooo_types::*;
                 end
             end
             TX_SEND: begin
-                // Honor backpressure: if the sink can't take this beat, freeze the
-                // FSM (don't advance idx, keep driving the same beat). Phase 1
-                // testbench always asserts tready so this is a no-op there.
                 if (!m_axis_tready) begin
                     emit_valid_n = emit_valid_q;
                 end else if (emit_idx == total_words - 4'd1) begin
-                    state_n      = TX_IDLE;
-                    emit_valid_n = 1'b0;     // last beat is THIS cycle (driven from emit_valid_q)
+                    state_n          = TX_IDLE;
+                    emit_valid_n     = 1'b0;
+                    send_ptr_advance = 1'b1;
                 end else begin
                     emit_valid_n = 1'b1;
                     issue_idx_n  = issue_idx + 4'd1;
@@ -177,15 +227,10 @@ import ooo_types::*;
         endcase
     end
 
-    // The TX FSM is an externally-visible side effect — once a pkt_s starts
-    // emitting, octets are already on the wire, so flushing mid-send would
-    // truncate the packet. Only reset clears the FSM. Speculative-start
-    // protection mirrors the rationale for fetch_trade's "pop at issue":
-    // pkt_s issues only after rs1 (length) is resolved, so it's typically
-    // on the resolved path by the cycle it reaches the FU.
     always_ff @(posedge clk) begin
         if (rst) begin
             state         <= TX_IDLE;
+            send_ptr      <= '0;
             issue_idx     <= '0;
             emit_idx      <= '0;
             total_words   <= '0;
@@ -198,11 +243,12 @@ import ooo_types::*;
             total_words   <= total_words_n;
             last_byte_cnt <= last_byte_cnt_n;
             emit_valid_q  <= emit_valid_n;
+            if (send_ptr_advance) send_ptr <= send_ptr + 1'b1;
         end
     end
 
-    // ---- AXI-Stream output (driven from registered state) ----
-    logic is_last_beat;
+    // ---- AXI-Stream output ----
+    logic       is_last_beat;
     logic [3:0] tkeep_last;
     assign is_last_beat = emit_valid_q && (emit_idx == total_words - 4'd1);
     assign tkeep_last   = (last_byte_cnt == 2'd0) ? 4'b1111 :
@@ -215,22 +261,11 @@ import ooo_types::*;
     assign m_axis_tlast  = is_last_beat;
     assign m_axis_tkeep  = is_last_beat ? tkeep_last : 4'b1111;
 
-    // Tell the RS we're mid-send and can't accept anything new. Must be a
-    // pure register read — if it depended on state_n it would close a
-    // combinational loop through the RS's stall input. The single-cycle gap
-    // (RS dequeues at the same rising edge state transitions to SEND) is
-    // fine because the RS only issues one entry per cycle anyway.
-    assign pkt_tx_busy = (state == TX_SEND);
+    // The RS only needs to stall when the staging FIFO can't accept another
+    // packet. The drain FSM running is fine — it's on a different slot.
+    assign pkt_tx_busy = fifo_full;
 
     // ---- CDB writeback (1-cycle delayed from issue) ----
-    // Both pkt_w and pkt_s writeback rd=0 (instructions always use x0 in the
-    // macros). The writeback exists so the ROB can retire the instruction.
-    // pkt_pipe holds the input for one cycle so cdb_pkt_tx can fire from a
-    // registered packet. We don't flush it on flush: the firmware uses rd=x0
-    // (see the PKT_W / PKT_S macros), so a stale writeback can't corrupt the
-    // PRF or wake spurious RS entries. Preserving the writeback also keeps
-    // the ROB from deadlocking when pkt_s is on the resolved path but a
-    // later mispredict (e.g., _fini's loop branch) flushes the pipeline.
     fu_pkt_tx_pkt pkt_pipe;
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -251,8 +286,6 @@ import ooo_types::*;
             cdb_pkt_tx.rob_index = pkt_pipe.rob_index;
             cdb_pkt_tx.rd_paddr  = pkt_pipe.rd_paddr;
             cdb_pkt_tx.rd_addr   = pkt_pipe.rd_addr;
-            // RVFI shadow expects the rs1 value the CPU actually read. Both
-            // pkt_w and pkt_s take rs1 (carried in pkt.data) and no rs2.
             cdb_pkt_tx.rs1_val   = pkt_pipe.data;
             cdb_pkt_tx.rs2_val   = 32'd0;
         end

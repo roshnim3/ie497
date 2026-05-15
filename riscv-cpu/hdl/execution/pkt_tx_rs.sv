@@ -5,9 +5,9 @@
 //   pkt_s  — rs1 holds the length (in octets) to emit on AXI-Stream.
 // Watches the three CDB lanes for rs1 wakeup. No rs2.
 //
-// The stall input lets the FU keep an entry parked while it's busy
-// draining a send (single-buffer Phase 1 — multi-buffer Phase 2 removes
-// this).
+// The stall input parks the head while the FU can't accept a new entry.
+// In Phase 2 the FU only stalls when its staging FIFO is full (8 packets
+// queued); ordinary back-to-back pkt_w/pkt_s issue freely.
 
 module pkt_tx_rs
 import ooo_types::*;

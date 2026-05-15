@@ -88,6 +88,28 @@
         .tready (pkt_tx_tready)
     );
 
+    // Concurrent-staging-vs-send counters. *_cycles increments any cycle
+    // the FU's BRAM Port A write fires while the FSM is also driving an
+    // AXI-Stream beat (Port B read). >0 proves staging and send genuinely
+    // overlap. The separate counts are sanity for what each side actually
+    // saw.
+    int pkt_tx_overlap_cycles;
+    int pkt_tx_writes;
+    int pkt_tx_emits;
+    always @(posedge clk) begin
+        if (rst) begin
+            pkt_tx_overlap_cycles <= 0;
+            pkt_tx_writes         <= 0;
+            pkt_tx_emits          <= 0;
+        end else begin
+            if (dut.pkt_tx_unit.port_a_we && dut.pkt_tx_unit.emit_valid_q) begin
+                pkt_tx_overlap_cycles <= pkt_tx_overlap_cycles + 1;
+            end
+            if (dut.pkt_tx_unit.port_a_we)    pkt_tx_writes <= pkt_tx_writes + 1;
+            if (dut.pkt_tx_unit.emit_valid_q) pkt_tx_emits  <= pkt_tx_emits + 1;
+        end
+    end
+
     // ---- Latency-histogram instrumentation ----
     // Firmware emits `slti x0, x0, 7` after processing each packet.
     // Encoded: imm=7, rs1=0, funct3=010, rd=0, opcode=0010011 -> 0x00702013.
@@ -195,6 +217,8 @@
                 $display("  Total Commits:     %0d", total_commits);
                 $display("====================================");
             end
+            $display("[pkt_tx] writes=%0d emits=%0d overlap=%0d",
+                     pkt_tx_writes, pkt_tx_emits, pkt_tx_overlap_cycles);
             // Dump latency histogram if streaming mode produced data.
             if (parser_enable && write_idx > 0) begin
                 int fd;
