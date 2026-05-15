@@ -20,6 +20,7 @@ ECE411_NO_FLOAT = $(shell python3 $(PWD)/../bin/get_options.py no_float)
 
 export VCS_ARCH_OVERRIDE=linux
 EXTRA_VCS_FLAGS ?=
+EXTRA_RUN_ARGS  ?=
 COMMON_FLAGS = +incdir+$(PWD)/../hvl/common  $(ECE411_NO_FLOAT) +define+DW_SUPPRESS_WARN +incdir+$(DW)/sim_ver $(XPM_INCDIR)
 VCS_FLAGS    = $(COMMON_FLAGS) +incdir+$(PWD)/../hvl/vcs -licqueue -full64 -lca -sverilog -timescale=1ps/1ps -debug_acc+all -kdb -suppress=LCA_FEATURES_ENABLED -msg_config=../vcs_warn.config -xprop=../xprop.config -xprop=flowctrl -assert svaext $(EXTRA_VCS_FLAGS)
 VER_FLAGS    = $(COMMON_FLAGS) +incdir+$(PWD)/../hvl/verilator -Wall --timescale 1ps/1ps -Mdir build -O3 -CFLAGS "-Ofast -march=native" --x-assign fast --x-initial fast --noassert --cc --exe ../verilator_warn.vlt --trace-fst --trace-structs --trace-max-array 1048576 --trace-max-width 1048576 +define+ECE411_VERILATOR
@@ -43,7 +44,8 @@ run_vcs_top_tb: vcs/top_tb $(PROG)
 		+CLOCK_PERIOD_PS_ECE411=$(shell python3 $(PWD)/../bin/get_options.py clock) \
 		+BRAM_0_ON_X_ECE411=$(shell python3 $(PWD)/../bin/get_options.py bmem_x) \
 		+MEMLST_ECE411="$(PWD)/bin/memory_32.lst" \
-		+ELF_ECE411="$(PWD)/bin/spike_dpi.elf"
+		+ELF_ECE411="$(PWD)/bin/spike_dpi.elf" \
+		$(EXTRA_RUN_ARGS)
 
 verilator/build/Vtop_tb: $(VER_SRCS) $(HDRS)
 	mkdir -p verilator/build

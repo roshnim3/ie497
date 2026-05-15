@@ -9,6 +9,7 @@ package ooo_types;
     localparam BR_RS_SIZE   = 8;  // Keep BR_RS_SIZE as power of 2
     localparam MEM_RS_SIZE  = 16; // Keep MEM_RS_SIZE as power of 2
     localparam FT_RS_SIZE   = 4;  // fetch_trade RS depth (power of 2)
+    localparam PT_RS_SIZE   = 4;  // pkt_tx RS depth (power of 2)
     localparam LSQ_SIZE     = 8;  // Keep LSQ_SIZE as power of 2
     localparam FETCH_Q_SIZE = 8;  // Keep FETCH_QUEUE_SIZE as power of 2
 
@@ -59,7 +60,8 @@ package ooo_types;
         op_store     = 7'b0100011, // store (S type)
         op_imm       = 7'b0010011, // arith ops with register/imemediate operands (I type)
         op_reg       = 7'b0110011, // arith ops with register operands (R type)
-        op_custom1   = 7'b0101011  // fetch_trade rd, imm[2:0] (I type, FU_FETCH_TRADE)
+        op_custom1   = 7'b0101011, // fetch_trade rd, imm[2:0] (I type, FU_FETCH_TRADE)
+        op_custom2   = 7'b1011011  // pkt_w / pkt_s — TX primitive (I type, FU_PKT_TX)
     } rv32i_opcode;
 
     // Branch funct3 codes
@@ -183,7 +185,8 @@ package ooo_types;
         FU_MEM         = 3'b010,
         FU_FETCH_TRADE = 3'b011, // custom-1: BRAM-backed parsed-field read
         FU_MUL         = 3'b100,
-        FU_DIV         = 3'b101
+        FU_DIV         = 3'b101,
+        FU_PKT_TX      = 3'b110  // custom-2: BRAM-backed TX primitive (pkt_w/pkt_s)
     } fu_flags;
 
     // Register Alias Table and Retirement Register Alias Table entry
@@ -439,6 +442,33 @@ package ooo_types;
         logic [4:0]    rd_addr;
         logic [$clog2(ROB_SIZE)-1:0] rob_index;
     } fu_fetch_trade_pkt;
+
+    // pkt_tx RS entry. Custom-2 takes one source operand (rs1):
+    //   pkt_w rd, rs1, off  — write rs1 (4 bytes) to TX BRAM[word_offset]
+    //   pkt_s rd, rs1       — start emitting first rs1 bytes onto AXI-Stream
+    // is_send distinguishes; word_offset is meaningful only when is_send=0.
+    typedef struct packed {
+        logic          valid;
+        logic [5:0]    rs1_paddr;
+        logic          rs1_ready;
+        logic [3:0]    word_offset;
+        logic          is_send;
+        logic [5:0]    rd_paddr;
+        logic [4:0]    rd_addr;
+        logic [$clog2(ROB_SIZE)-1:0] rob_index;
+    } rs_pkt_tx_entry_t;
+
+    // pkt_tx FU input. data carries rs1 (the value to write for pkt_w, or
+    // the length in octets for pkt_s). The FU shares the mul/div CDB lane.
+    typedef struct packed {
+        logic          valid;
+        logic [31:0]   data;
+        logic [3:0]    word_offset;
+        logic          is_send;
+        logic [5:0]    rd_paddr;
+        logic [4:0]    rd_addr;
+        logic [$clog2(ROB_SIZE)-1:0] rob_index;
+    } fu_pkt_tx_pkt;
 
     typedef struct packed {
         logic           valid;

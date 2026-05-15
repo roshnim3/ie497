@@ -16,6 +16,7 @@ import ooo_types::*;
     input  logic            rs_div_full,
     input  logic            rs_mem_full,
     input  logic            rs_ft_full,
+    input  logic            rs_pt_full,
 
     // LSQ index for mem operations
     input  logic [$clog2(LSQ_SIZE)-1:0] next_lsq_index,
@@ -28,7 +29,8 @@ import ooo_types::*;
     output rs_mul_entry_t           rs_mul_enq,
     output rs_div_entry_t           rs_div_enq,
     output rs_mem_entry_t           rs_mem_enq,
-    output rs_fetch_trade_entry_t   rs_ft_enq
+    output rs_fetch_trade_entry_t   rs_ft_enq,
+    output rs_pkt_tx_entry_t        rs_pt_enq
 );
 
     // Helper signals for CDB bypass detection
@@ -49,6 +51,7 @@ import ooo_types::*;
         rs_div_enq = '0;
         rs_mem_enq = '0;
         rs_ft_enq  = '0;
+        rs_pt_enq  = '0;
 
         // Don't dispatch if flush is active (pipeline is being flushed)
         if(rename_pkt.valid && !flush && !rob_full) begin        
@@ -128,6 +131,17 @@ import ooo_types::*;
                     rs_ft_enq.rd_addr     = rename_pkt.rd_addr;
                     rs_ft_enq.rob_index    = rename_pkt.rob_index;
                 end
+                FU_PKT_TX: begin
+                    // imm[4] = is_send, imm[3:0] = word_offset (see decode).
+                    rs_pt_enq.valid        = 1'b1;
+                    rs_pt_enq.rs1_paddr    = rename_pkt.rs1_paddr;
+                    rs_pt_enq.rs1_ready    = rename_pkt.rs1_ready || rs1_cdb_match;
+                    rs_pt_enq.word_offset  = rename_pkt.imm[3:0];
+                    rs_pt_enq.is_send      = rename_pkt.imm[4];
+                    rs_pt_enq.rd_paddr     = rename_pkt.rd_paddr;
+                    rs_pt_enq.rd_addr      = rename_pkt.rd_addr;
+                    rs_pt_enq.rob_index    = rename_pkt.rob_index;
+                end
                 default: begin
                     // Default case already handled by initial assignments
                 end
@@ -143,6 +157,7 @@ import ooo_types::*;
             FU_DIV:          rs_full = rs_div_full;
             FU_MEM:          rs_full = rs_mem_full;
             FU_FETCH_TRADE:  rs_full = rs_ft_full;
+            FU_PKT_TX:       rs_full = rs_pt_full;
             default:
                 rs_full = 1'b0;
         endcase

@@ -47,7 +47,11 @@ module prf (
     // MEM write port (from CDB)
     input logic  [5:0]      mem_pd_addr,
     input logic             mem_pd_wen,
-    input logic [31:0]      mem_pd_wdata
+    input logic [31:0]      mem_pd_wdata,
+
+    // PKT_TX read port (rs1 only — pkt_w/pkt_s have one source operand)
+    input logic  [5:0]      pt_ps1_addr,
+    output logic [31:0]     pt_pr1_data
 );
 
     logic [31:0] registers[63:0];
@@ -81,5 +85,6 @@ module prf (
     assign div_pr2_data = registers[div_ps2_addr];
     assign mem_pr1_data = registers[mem_ps1_addr];
     assign mem_pr2_data = registers[mem_ps2_addr];
+    assign pt_pr1_data  = registers[pt_ps1_addr];
 
 endmodule : prf

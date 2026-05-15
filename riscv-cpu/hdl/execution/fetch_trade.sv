@@ -9,7 +9,7 @@
 //
 // FIFO discipline: parser writes one packet's fields then pulses
 // parser_commit to advance the FU's head_ptr. CPU reads fields from the
-// tail packet and issues `fetch_trade _, 5` to advance tail_ptr.
+// tail packet and issues fetch_trade with field_idx=5 to advance tail_ptr.
 //
 // Backward compatibility with static benchmarks (no parser writes): the
 // MEMORY_INIT_PARAM populates packet 0 at reset, and head_ptr resets to 1.
@@ -37,10 +37,10 @@ import ooo_types::*;
     output cdb_mul_div_pkt    cdb_trade
 );
 
-    localparam int DEPTH      = 8;   // packet slots in the FIFO
-    localparam int DEPTH_BITS = 3;   // $clog2(DEPTH)
+    localparam DEPTH      = 8;       // packet slots in the FIFO
+    localparam DEPTH_BITS = 3;       // log2(DEPTH)
 
-    // 4-bit pointers: top bit distinguishes wrap, low 3 bits index packet.
+    // 4-entry pointers: MSB distinguishes wrap, low 3 select packet slot.
     logic [DEPTH_BITS:0] head_ptr;
     logic [DEPTH_BITS:0] tail_ptr;
 
@@ -112,26 +112,34 @@ import ooo_types::*;
         .dbiterrb               ()
     );
 
-    // FIFO pointers + pipeline register, all aligned to the BRAM read.
-    // Pop fires at issue time (when field_idx==5 with a valid packet). This
-    // is a side effect at issue rather than at commit; the firmware in
-    // itch_stream.c keeps the polling+read+pop sequence on a straight-line
-    // path so speculative squash is not a concern in practice.
+    // FIFO pointers persist across flushes — they reflect packets the parser
+    // has produced and the firmware has consumed, both of which are externally
+    // visible side effects. Only the in-flight pipeline register (ft_pipe) is
+    // squashed on flush so a mispredicted read doesn't drive cdb_trade.
+    //
+    // Pop fires at issue rather than commit. The firmware in itch_stream.c
+    // keeps the polling+read+pop sequence on a straight-line path, and the
+    // BP cannot speculate past the FETCH_TRADE(4) until its result resolves
+    // because the branch depends on it. So a speculative pop would require
+    // the FETCH_TRADE(4) result + branch resolution to land before the pop
+    // dispatches — at which point the pop is on the resolved path. This makes
+    // speculative-pop loss a non-issue in practice for this firmware.
     logic do_pop;
     assign do_pop = ft_pkt.valid && (ft_pkt.field_idx == 3'd5) && !fifo_empty;
 
     always_ff @(posedge clk) begin
-        if (rst || flush) begin
+        if (rst) begin
             head_ptr   <= {1'b0, 3'd1};   // packet 0 pre-init for static benchmarks
             tail_ptr   <= '0;
             ft_pipe    <= '0;
             empty_pipe <= 1'b0;
         end else begin
-            ft_pipe    <= ft_pkt;
+            if (flush) ft_pipe <= '0;
+            else       ft_pipe <= ft_pkt;
             empty_pipe <= fifo_empty;
 
             if (parser_commit && !fifo_full) head_ptr <= head_ptr + 1'b1;
-            if (do_pop)                      tail_ptr <= tail_ptr + 1'b1;
+            if (do_pop && !flush)            tail_ptr <= tail_ptr + 1'b1;
         end
     end
 

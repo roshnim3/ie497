@@ -20,7 +20,16 @@ import ooo_types::*;
     input   logic               parser_we,
     input   logic   [2:0]       parser_addr,
     input   logic   [31:0]      parser_data,
-    input   logic               parser_commit
+    input   logic               parser_commit,
+
+    // TX AXI-Stream master — driven by the pkt_tx FU when firmware issues
+    // a pkt_s. Connect to a sink (testbench fake_packet_sink or a CMAC
+    // width-converter+adapter on hardware). tready ignored in Phase 1.
+    output  logic               m_axis_pkt_tx_tvalid,
+    output  logic   [31:0]      m_axis_pkt_tx_tdata,
+    output  logic   [3:0]       m_axis_pkt_tx_tkeep,
+    output  logic               m_axis_pkt_tx_tlast,
+    input   logic               m_axis_pkt_tx_tready
 );
 
     // RVFI packet
@@ -140,6 +149,7 @@ import ooo_types::*;
     logic           rs_div_full, rs_div_empty;
     logic           rs_mem_full, rs_mem_empty;
     logic           rs_ft_full,  rs_ft_empty;
+    logic           rs_pt_full,  rs_pt_empty;
 
     rs_br_entry_t           rs_br_enq;
     rs_alu_entry_t          rs_alu_enq;
@@ -147,6 +157,7 @@ import ooo_types::*;
     rs_div_entry_t          rs_div_enq;
     rs_mem_entry_t          rs_mem_enq;
     rs_fetch_trade_entry_t  rs_ft_enq;
+    rs_pkt_tx_entry_t       rs_pt_enq;
     
     // LSQ signals
     logic           lsq_full, lsq_empty;
@@ -168,6 +179,11 @@ import ooo_types::*;
 
     rs_fetch_trade_entry_t  rs_ft_ready_entry;
 
+    rs_pkt_tx_entry_t       rs_pt_ready_entry;
+    logic [31:0]            pt_pr1_data;
+    fu_pkt_tx_pkt           pt_pkt;
+    logic                   pkt_tx_busy;
+
     cdb_br_pkt      cdb_br;
     cdb_alu_pkt     cdb_alu, cdb_alu_latched;
     cdb_alu_br_pkt  cdb_alu_br;
@@ -181,6 +197,10 @@ import ooo_types::*;
     cdb_mul_div_pkt cdb_trade_buf_dout;
     logic           cdb_trade_buf_enq, cdb_trade_buf_deq;
     logic           cdb_trade_buf_full, cdb_trade_buf_empty;
+    cdb_mul_div_pkt cdb_pkt_tx;                 // pkt_tx FU output, shares mul/div lane
+    cdb_mul_div_pkt cdb_pkt_tx_buf_dout;
+    logic           cdb_pkt_tx_buf_enq, cdb_pkt_tx_buf_deq;
+    logic           cdb_pkt_tx_buf_full, cdb_pkt_tx_buf_empty;
     cdb_mem_pkt     cdb_mem;
 
     // Simplified wakeup packets for RS (only valid and rd_paddr)
@@ -378,7 +398,30 @@ import ooo_types::*;
         .empty  (cdb_trade_buf_empty)
     );
 
-    // MUL/DIV/TRADE CDB arbiter — DIV > mul_buf > MUL > trade_buf > TRADE
+    // pkt_tx queues behind trade on the same CDB lane. Same rationale —
+    // mul/div idle in HFT workload, but the queue handles the rare collision.
+    assign cdb_pkt_tx_buf_enq = cdb_pkt_tx.valid &&
+                                (cdb_div.valid || !cdb_mul_buf_empty || cdb_mul.valid ||
+                                 !cdb_trade_buf_empty || cdb_trade.valid || !cdb_pkt_tx_buf_empty);
+    assign cdb_pkt_tx_buf_deq = !cdb_div.valid && cdb_mul_buf_empty && !cdb_mul.valid &&
+                                cdb_trade_buf_empty && !cdb_trade.valid && !cdb_pkt_tx_buf_empty;
+
+    queue #(
+        .DATA_WIDTH($bits(cdb_mul_div_pkt)),
+        .QUEUE_SIZE(4)
+    ) pkt_tx_result_buffer (
+        .clk    (clk),
+        .rst    (rst),
+        .flush  ((|flush)),
+        .enq    (cdb_pkt_tx_buf_enq && !cdb_pkt_tx_buf_full),
+        .deq    (cdb_pkt_tx_buf_deq),
+        .din    (cdb_pkt_tx),
+        .dout   (cdb_pkt_tx_buf_dout),
+        .full   (cdb_pkt_tx_buf_full),
+        .empty  (cdb_pkt_tx_buf_empty)
+    );
+
+    // MUL/DIV/TRADE/PKT_TX CDB arbiter — DIV > mul_buf > MUL > trade_buf > TRADE > pkt_tx_buf > PKT_TX
     always_comb begin
         if (cdb_div.valid) begin
             cdb_mul_div = cdb_div;
@@ -394,6 +437,12 @@ import ooo_types::*;
         end
         else if (cdb_trade.valid) begin
             cdb_mul_div = cdb_trade;
+        end
+        else if (!cdb_pkt_tx_buf_empty) begin
+            cdb_mul_div = cdb_pkt_tx_buf_dout;
+        end
+        else if (cdb_pkt_tx.valid) begin
+            cdb_mul_div = cdb_pkt_tx;
         end
         else begin
             cdb_mul_div = '0;
@@ -502,6 +551,34 @@ import ooo_types::*;
         end
     end
 
+    pkt_tx pkt_tx_unit (
+        .clk            (clk),
+        .rst            (rst),
+        .flush          ((|flush)),
+        .pkt            (pt_pkt),
+        .pkt_tx_busy    (pkt_tx_busy),
+        .m_axis_tvalid  (m_axis_pkt_tx_tvalid),
+        .m_axis_tdata   (m_axis_pkt_tx_tdata),
+        .m_axis_tkeep   (m_axis_pkt_tx_tkeep),
+        .m_axis_tlast   (m_axis_pkt_tx_tlast),
+        .m_axis_tready  (m_axis_pkt_tx_tready),
+        .cdb_pkt_tx     (cdb_pkt_tx)
+    );
+
+    always_comb begin
+        if (rs_pt_ready_entry.valid && rs_pt_ready_entry.rs1_ready) begin
+            pt_pkt.valid       = 1'b1;
+            pt_pkt.data        = pt_pr1_data;
+            pt_pkt.word_offset = rs_pt_ready_entry.word_offset;
+            pt_pkt.is_send     = rs_pt_ready_entry.is_send;
+            pt_pkt.rd_paddr    = rs_pt_ready_entry.rd_paddr;
+            pt_pkt.rd_addr     = rs_pt_ready_entry.rd_addr;
+            pt_pkt.rob_index   = rs_pt_ready_entry.rob_index;
+        end else begin
+            pt_pkt = '0;
+        end
+    end
+
     always_comb begin
         if (rs_alu_ready_entry.valid & rs_alu_ready_entry.rs1_ready & rs_alu_ready_entry.rs2_ready) begin
             alu_pkt.valid = 1'b1;
@@ -602,7 +679,10 @@ import ooo_types::*;
 
         .mem_pd_addr        (cdb_mem.rd_paddr),
         .mem_pd_wen         (cdb_mem.valid),
-        .mem_pd_wdata       (cdb_mem.result)
+        .mem_pd_wdata       (cdb_mem.result),
+
+        .pt_ps1_addr        (rs_pt_ready_entry.rs1_paddr),
+        .pt_pr1_data        (pt_pr1_data)
     );
 
        // Reservation Stations
@@ -735,6 +815,24 @@ import ooo_types::*;
         .rs_ready_entry (rs_ft_ready_entry)
     );
 
+    pkt_tx_rs #(
+        .RS_SIZE       (PT_RS_SIZE)
+    )
+    pkt_tx_res_station (
+        .clk                (clk),
+        .rst                (rst),
+        .flush              ((|flush)),
+        .stall              (pkt_tx_busy),
+        .new_entry          (rs_pt_enq),
+        .cdb_alu_br_wakeup  (cdb_alu_br_wakeup),
+        .cdb_mul_div_wakeup (cdb_mul_div_wakeup),
+        .cdb_mem_wakeup     (cdb_mem_wakeup),
+
+        .rs_full            (rs_pt_full),
+        .rs_empty           (rs_pt_empty),
+        .rs_ready_entry     (rs_pt_ready_entry)
+    );
+
     // Combine RS and LSQ full signals for memory operations
     // Memory operations need space in BOTH the reservation station AND the LSQ
     logic rs_mem_or_lsq_full;
@@ -756,6 +854,7 @@ import ooo_types::*;
         .rs_div_full            (rs_div_full),
         .rs_mem_full            (rs_mem_or_lsq_full),  // Combined RS+LSQ full signal
         .rs_ft_full             (rs_ft_full),
+        .rs_pt_full             (rs_pt_full),
 
         // LSQ index for mem operations
         .next_lsq_index         (next_lsq_index),
@@ -767,6 +866,7 @@ import ooo_types::*;
         .rs_div_enq             (rs_div_enq),
         .rs_mem_enq             (rs_mem_enq),
         .rs_ft_enq              (rs_ft_enq),
+        .rs_pt_enq              (rs_pt_enq),
 
         .rs_full                (rs_full)
     );

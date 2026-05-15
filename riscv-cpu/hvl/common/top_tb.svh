@@ -46,6 +46,13 @@
     assign parser_data   = parser_enable ? fp_data   : 32'b0;
     assign parser_commit = parser_enable ? fp_commit : 1'b0;
 
+    // pkt_tx AXI-Stream master from the CPU
+    logic        pkt_tx_tvalid;
+    logic [31:0] pkt_tx_tdata;
+    logic [3:0]  pkt_tx_tkeep;
+    logic        pkt_tx_tlast;
+    logic        pkt_tx_tready;
+
     cpu dut(
         .clk            (clk),
         .rst            (rst),
@@ -62,7 +69,23 @@
         .parser_we     (parser_we),
         .parser_addr   (parser_addr),
         .parser_data   (parser_data),
-        .parser_commit (parser_commit)
+        .parser_commit (parser_commit),
+
+        .m_axis_pkt_tx_tvalid (pkt_tx_tvalid),
+        .m_axis_pkt_tx_tdata  (pkt_tx_tdata),
+        .m_axis_pkt_tx_tkeep  (pkt_tx_tkeep),
+        .m_axis_pkt_tx_tlast  (pkt_tx_tlast),
+        .m_axis_pkt_tx_tready (pkt_tx_tready)
+    );
+
+    fake_packet_sink pkt_tx_sink (
+        .clk    (clk),
+        .rst    (rst),
+        .tvalid (pkt_tx_tvalid),
+        .tdata  (pkt_tx_tdata),
+        .tkeep  (pkt_tx_tkeep),
+        .tlast  (pkt_tx_tlast),
+        .tready (pkt_tx_tready)
     );
 
     // ---- Latency-histogram instrumentation ----
@@ -142,8 +165,24 @@
         end
     end
 
+    // Drain delay — give the pkt_tx AXI-Stream a window to finish a send in
+    // flight when the firmware's halt marker commits before the last beat
+    // leaves the FU. Counts down only while idle so we don't fire mid-burst.
+    int pkt_tx_drain_cycles;
+    initial pkt_tx_drain_cycles = 32;
+
     always @(posedge clk) begin
-        if (mon_itf.halt) begin
+        if (mon_itf.halt && pkt_tx_drain_cycles > 0) begin
+            if (pkt_tx_tvalid) begin
+                pkt_tx_drain_cycles <= 32;       // reset window each beat
+            end else begin
+                pkt_tx_drain_cycles <= pkt_tx_drain_cycles - 1;
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (mon_itf.halt && pkt_tx_drain_cycles == 0) begin
             // Print BP accuracy stats before finishing
             real bp_accuracy;
             if (total_branches > 0) begin
