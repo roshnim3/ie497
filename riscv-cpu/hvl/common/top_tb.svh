@@ -158,6 +158,44 @@
         end
     end
 
+    // ---- Tick-to-trade per-packet TX timestamping ----
+    // tx_first_beat_ts[K] stamps the cycle the K-th emitted frame's first
+    // AXI-Stream beat fires. tx_parser_idx[K] = commit_idx at that moment,
+    // which is the index into write_ts[] for the parser packet that fed
+    // the decision (the firmware processes parser packets in FIFO order
+    // and emits PACKET_DONE per iteration, so commit_idx at TX time names
+    // the parser packet currently being processed).
+    //
+    // itch_tick_to_trade.c drops the FU's preloaded slot before the metric
+    // loop, so iteration K of the loop matches parser commit K.
+    longint tx_first_beat_ts [LATENCY_LOG_SIZE];
+    int     tx_parser_idx    [LATENCY_LOG_SIZE];
+    int     tx_idx;
+    logic   tx_in_packet;
+
+    initial begin
+        tx_idx       = 0;
+        tx_in_packet = 1'b0;
+        for (int i = 0; i < LATENCY_LOG_SIZE; i++) begin
+            tx_first_beat_ts[i] = -64'sd1;
+            tx_parser_idx[i]    = -1;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (!rst) begin
+            if (pkt_tx_tvalid && pkt_tx_tready) begin
+                if (!tx_in_packet && tx_idx < LATENCY_LOG_SIZE) begin
+                    tx_first_beat_ts[tx_idx] <= cycle_count;
+                    tx_parser_idx[tx_idx]    <= commit_idx;
+                    tx_idx                   <= tx_idx + 1;
+                end
+                // tx_in_packet stays 1 mid-frame; clears the cycle after tlast.
+                tx_in_packet <= !pkt_tx_tlast;
+            end
+        end
+    end
+
     `include "rvfi_reference.svh"
 
     // Branch Prediction Accuracy Monitor
@@ -234,6 +272,31 @@
                 $fclose(fd);
                 $display("Latency histogram: %0d packets logged to latency.csv", n);
                 $display("  write_idx=%0d commit_idx=%0d", write_idx, commit_idx);
+            end
+
+            // Tick-to-trade latency: parser commit -> first TX beat for
+            // every emitted (accepted) packet. Skip rows where the parser
+            // idx falls outside write_ts[] (preloaded packet — shouldn't
+            // hit with itch_tick_to_trade.c, defensive only).
+            if (parser_enable && tx_idx > 0) begin
+                int fd_tt;
+                int dumped;
+                fd_tt  = $fopen("tick_to_trade_latency.csv", "w");
+                dumped = 0;
+                $fdisplay(fd_tt, "accept_idx,parser_commit_cycle,tx_first_beat_cycle,latency_cycles");
+                for (int i = 0; i < tx_idx; i++) begin
+                    if (tx_parser_idx[i] >= 0 && tx_parser_idx[i] < write_idx) begin
+                        $fdisplay(fd_tt, "%0d,%0d,%0d,%0d",
+                                  i,
+                                  write_ts[tx_parser_idx[i]],
+                                  tx_first_beat_ts[i],
+                                  tx_first_beat_ts[i] - write_ts[tx_parser_idx[i]]);
+                        dumped++;
+                    end
+                end
+                $fclose(fd_tt);
+                $display("Tick-to-trade: %0d accepted frames logged to tick_to_trade_latency.csv (tx_idx=%0d)",
+                         dumped, tx_idx);
             end
             $finish;
         end
