@@ -132,12 +132,20 @@ import ooo_types::*;
                     rs_ft_enq.rob_index    = rename_pkt.rob_index;
                 end
                 FU_PKT_TX: begin
-                    // imm[4] = is_send, imm[3:0] = word_offset (see decode).
+                    // imm[5:4] = funct3[1:0] = op selector
+                    //   00 = pkt_w  (rs1 = data,   imm[3:0] = word offset)
+                    //   01 = pkt_s  (rs1 = length, imm = 0)
+                    //   10 = pkt_st (rs1 unused,   imm[3:0] = status field)
                     rs_pt_enq.valid        = 1'b1;
                     rs_pt_enq.rs1_paddr    = rename_pkt.rs1_paddr;
-                    rs_pt_enq.rs1_ready    = rename_pkt.rs1_ready || rs1_cdb_match;
+                    // pkt_st has no architected source operand — force rs1_ready
+                    // so it can issue immediately even on x0 dependencies.
+                    rs_pt_enq.rs1_ready    = (rename_pkt.imm[5:4] == 2'b10)
+                                           ? 1'b1
+                                           : (rename_pkt.rs1_ready || rs1_cdb_match);
                     rs_pt_enq.word_offset  = rename_pkt.imm[3:0];
-                    rs_pt_enq.is_send      = rename_pkt.imm[4];
+                    rs_pt_enq.is_send      = (rename_pkt.imm[5:4] == 2'b01);
+                    rs_pt_enq.is_status    = (rename_pkt.imm[5:4] == 2'b10);
                     rs_pt_enq.rd_paddr     = rename_pkt.rd_paddr;
                     rs_pt_enq.rd_addr      = rename_pkt.rd_addr;
                     rs_pt_enq.rob_index    = rename_pkt.rob_index;

@@ -231,14 +231,15 @@ import ooo_types::*;
             end
 
             // custom-2: TX primitive (I-type), opcode=1011011
-            //   funct3 = 0  → pkt_w rd, rs1, imm[3:0]  — write 4 bytes (rs1) to TX BRAM[imm]
-            //   funct3 = 1  → pkt_s rd, rs1            — send first rs1 bytes from TX BRAM
-            // Pack {is_send, word_offset[3:0]} into the low bits of imm so dispatch
+            //   funct3 = 0  → pkt_w  rd, rs1, imm[3:0]  — write 4 octets to TX BRAM[imm]
+            //   funct3 = 1  → pkt_s  rd, rs1            — send first rs1 octets
+            //   funct3 = 2  → pkt_st rd, imm[2:0]       — read TX status field (no rs1)
+            // Pack {funct3[1:0], word_offset[3:0]} into imm[5:0] so dispatch
             // can route without inspecting funct3 directly.
             op_custom2: begin
                 decode_packet_next.rd_addr      = inst.i_type.rd;
                 decode_packet_next.rs1_addr     = inst.i_type.rs1;
-                decode_packet_next.imm          = {27'b0, inst.i_type.funct3[0], inst.i_type.imm[3:0]};
+                decode_packet_next.imm          = {26'b0, inst.i_type.funct3[1:0], inst.i_type.imm[3:0]};
                 decode_packet_next.fu_flag      = FU_PKT_TX;
             end
 

@@ -135,17 +135,21 @@ import ooo_types::*;
         .dbiterrb               ()
     );
 
-    // ---- CPU-side: pkt_w / pkt_s acceptance ----
-    // The RS stalls when fifo_full, so pkt.valid && !fifo_full means the
-    // entry is genuinely landing in this slot.
+    // ---- CPU-side: pkt_w / pkt_s / pkt_st acceptance ----
+    // The RS stalls pkt_w/pkt_s on fifo_full but lets pkt_st through, so
+    // valid pkts here are always accepted: a pkt_st observes status
+    // without touching the BRAM or staging_ptr; a pkt_w/pkt_s only lands
+    // when the FIFO isn't full (guaranteed by the RS-stall path).
     logic issue_pkt;
     logic issue_send;
     logic issue_write;
-    assign issue_pkt   = pkt.valid && !fifo_full;
-    assign issue_send  = issue_pkt &&  pkt.is_send;
-    assign issue_write = issue_pkt && !pkt.is_send;
+    logic issue_status;
+    assign issue_status = pkt.valid &&  pkt.is_status;
+    assign issue_send   = pkt.valid &&  pkt.is_send && !fifo_full;
+    assign issue_write  = pkt.valid && !pkt.is_send && !pkt.is_status && !fifo_full;
+    assign issue_pkt    = issue_status || issue_send || issue_write;
 
-    // BRAM Port A write — combinational from pkt; addr selects staging slot.
+    // BRAM Port A write — only for pkt_w; addr selects staging slot.
     assign port_a_we   = issue_write;
     assign port_a_addr = {staging_ptr[BUF_DEPTH_BITS-1:0], pkt.word_offset};
     assign port_a_data = pkt.data;
@@ -162,7 +166,7 @@ import ooo_types::*;
         end
     end
 
-    // ---- HW drain FSM ----
+    // ---- HW drain FSM (declared early so the status mux can sample state) ----
     typedef enum logic [0:0] { TX_IDLE = 1'b0, TX_SEND = 1'b1 } tx_state_t;
 
     tx_state_t  state, state_n;
@@ -170,6 +174,29 @@ import ooo_types::*;
     logic [3:0] emit_idx,  emit_idx_n;        // index of the beat driven this cycle
     logic [3:0] total_words, total_words_n;   // ceil(length_octets / 4)
     logic [1:0] last_byte_cnt, last_byte_cnt_n;
+
+    // ---- pkt_st: status read mux ----
+    // Returns the selected status field through the CDB lane. pkt_st has
+    // no BRAM or FSM interaction; the FU treats it as a single-cycle
+    // observation (same path as pkt_w/pkt_s CDB writeback, registered
+    // through pkt_pipe + status_pipe).
+    //   imm 0  tx_empty   — staging FIFO empty AND drain FSM idle
+    //   imm 1  tx_full    — staging FIFO full (next pkt_s would stall)
+    //   imm 2  tx_busy    — drain FSM in SEND
+    //   imm 3  tx_pending — count of staged packets not yet drained
+    //   imm 4-7 reserved  — return 0
+    logic [31:0] status_result;
+    logic [BUF_DEPTH_BITS:0] pending_count;
+    assign pending_count = staging_ptr - send_ptr;  // wraps via MSB
+    always_comb begin
+        unique case (pkt.word_offset[2:0])
+            3'd0:    status_result = {31'b0, fifo_empty && (state == TX_IDLE)};
+            3'd1:    status_result = {31'b0, fifo_full};
+            3'd2:    status_result = {31'b0, (state == TX_SEND)};
+            3'd3:    status_result = {28'b0, pending_count};
+            default: status_result = 32'd0;
+        endcase
+    end
     logic       emit_valid_q, emit_valid_n;
 
     // Length decoding for the slot being picked up at IDLE->SEND.
@@ -266,14 +293,21 @@ import ooo_types::*;
     assign pkt_tx_busy = fifo_full;
 
     // ---- CDB writeback (1-cycle delayed from issue) ----
+    // pkt_pipe holds the FU input for one cycle so cdb_pkt_tx can drive
+    // from a registered packet. status_pipe carries the pkt_st result
+    // alongside; for pkt_w/pkt_s it stays 0.
     fu_pkt_tx_pkt pkt_pipe;
+    logic [31:0]  status_pipe;
     always_ff @(posedge clk) begin
         if (rst) begin
-            pkt_pipe <= '0;
+            pkt_pipe    <= '0;
+            status_pipe <= 32'd0;
         end else begin
-            pkt_pipe <= '0;
+            pkt_pipe    <= '0;
+            status_pipe <= 32'd0;
             if (issue_pkt) begin
                 pkt_pipe <= pkt;
+                if (pkt.is_status) status_pipe <= status_result;
             end
         end
     end
@@ -282,11 +316,16 @@ import ooo_types::*;
         cdb_pkt_tx = '{default: '0};
         if (pkt_pipe.valid) begin
             cdb_pkt_tx.valid     = 1'b1;
-            cdb_pkt_tx.result    = 32'd0;
+            // pkt_st returns the captured status value to rd; pkt_w/pkt_s
+            // emit 0 (their rd is x0 in the firmware macros).
+            cdb_pkt_tx.result    = pkt_pipe.is_status ? status_pipe : 32'd0;
             cdb_pkt_tx.rob_index = pkt_pipe.rob_index;
             cdb_pkt_tx.rd_paddr  = pkt_pipe.rd_paddr;
             cdb_pkt_tx.rd_addr   = pkt_pipe.rd_addr;
-            cdb_pkt_tx.rs1_val   = pkt_pipe.data;
+            // RVFI shadow expects rs1_rdata = actual rs1 value the CPU
+            // read. pkt_st uses x0 (rs1_rdata = 0); pkt_w/pkt_s use the
+            // architected rs1 carried in pkt.data.
+            cdb_pkt_tx.rs1_val   = pkt_pipe.is_status ? 32'd0 : pkt_pipe.data;
             cdb_pkt_tx.rs2_val   = 32'd0;
         end
     end

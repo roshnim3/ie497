@@ -113,7 +113,11 @@
     // ---- Latency-histogram instrumentation ----
     // Firmware emits `slti x0, x0, 7` after processing each packet.
     // Encoded: imm=7, rs1=0, funct3=010, rd=0, opcode=0010011 -> 0x00702013.
-    localparam logic [31:0] PACKET_DONE_MARKER = 32'h00702013;
+    // Throughput-bench markers: slti x0, x0, 5 (start) -> 0x00502013
+    //                           slti x0, x0, 6 (end)   -> 0x00602013
+    localparam logic [31:0] PACKET_DONE_MARKER  = 32'h00702013;
+    localparam logic [31:0] THROUGHPUT_START_MARKER = 32'h00502013;
+    localparam logic [31:0] THROUGHPUT_END_MARKER   = 32'h00602013;
     localparam int LATENCY_LOG_SIZE = 4096;
 
     longint write_ts  [LATENCY_LOG_SIZE];
@@ -133,6 +137,31 @@
     end
 
     always @(posedge clk) if (!rst) cycle_count <= cycle_count + 64'd1;
+
+    // ---- Throughput markers ----
+    // Capture cycle counts when the firmware commits slti-5 / slti-6.
+    longint throughput_start_cycle;
+    longint throughput_end_cycle;
+    initial begin
+        throughput_start_cycle = -64'sd1;
+        throughput_end_cycle   = -64'sd1;
+    end
+    always @(posedge clk) begin
+        if (!rst) begin
+            if (dut.commit[0] && dut.rob_head_entry[0].inst == THROUGHPUT_START_MARKER
+                && throughput_start_cycle < 0)
+                throughput_start_cycle <= cycle_count;
+            if (dut.commit[1] && dut.rob_head_entry[1].inst == THROUGHPUT_START_MARKER
+                && throughput_start_cycle < 0)
+                throughput_start_cycle <= cycle_count;
+            if (dut.commit[0] && dut.rob_head_entry[0].inst == THROUGHPUT_END_MARKER
+                && throughput_end_cycle < 0)
+                throughput_end_cycle <= cycle_count;
+            if (dut.commit[1] && dut.rob_head_entry[1].inst == THROUGHPUT_END_MARKER
+                && throughput_end_cycle < 0)
+                throughput_end_cycle <= cycle_count;
+        end
+    end
 
     // Record parser write times (one per new packet, on the seq slot 3 write)
     always @(posedge clk) begin
@@ -452,6 +481,28 @@
                 $fclose(fd_br);
                 $display("Tick-to-trade waterfall: %0d rows logged to tick_to_trade_breakdown.csv",
                          br_accept_idx);
+            end
+
+            // Throughput benchmark dump. M_PACKETS-from-firmware is read
+            // by inspecting bench_packets in memory; here we just dump
+            // total cycles, cycles/packet, theoretical min. theoretical
+            // min = 16 (drain time per 64-octet packet, 1 beat/word).
+            if (throughput_start_cycle >= 0 && throughput_end_cycle >= 0) begin
+                int fd_th;
+                longint total_cyc;
+                int     n_pkts;
+                fd_th     = $fopen("throughput.csv", "w");
+                total_cyc = throughput_end_cycle - throughput_start_cycle;
+                n_pkts    = 100;   // matches M_PACKETS default in firmware
+                $fdisplay(fd_th, "packets,total_cycles,cycles_per_packet,theoretical_min_cycles_per_packet");
+                $fdisplay(fd_th, "%0d,%0d,%0.3f,%0d",
+                          n_pkts,
+                          total_cyc,
+                          real'(total_cyc) / real'(n_pkts),
+                          16);
+                $fclose(fd_th);
+                $display("Throughput: %0d packets in %0d cycles (%0.3f cyc/pkt)",
+                         n_pkts, total_cyc, real'(total_cyc) / real'(n_pkts));
             end
             $finish;
         end

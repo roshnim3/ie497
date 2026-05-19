@@ -571,6 +571,7 @@ import ooo_types::*;
             pt_pkt.data        = pt_pr1_data;
             pt_pkt.word_offset = rs_pt_ready_entry.word_offset;
             pt_pkt.is_send     = rs_pt_ready_entry.is_send;
+            pt_pkt.is_status   = rs_pt_ready_entry.is_status;
             pt_pkt.rd_paddr    = rs_pt_ready_entry.rd_paddr;
             pt_pkt.rd_addr     = rs_pt_ready_entry.rd_addr;
             pt_pkt.rob_index   = rs_pt_ready_entry.rob_index;

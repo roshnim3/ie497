@@ -443,28 +443,35 @@ package ooo_types;
         logic [$clog2(ROB_SIZE)-1:0] rob_index;
     } fu_fetch_trade_pkt;
 
-    // pkt_tx RS entry. Custom-2 takes one source operand (rs1):
-    //   pkt_w rd, rs1, off  — write rs1 (4 bytes) to TX BRAM[word_offset]
-    //   pkt_s rd, rs1       — start emitting first rs1 bytes onto AXI-Stream
-    // is_send distinguishes; word_offset is meaningful only when is_send=0.
+    // pkt_tx RS entry. Custom-2 (opcode 0x5b) covers three instructions
+    // distinguished by funct3:
+    //   funct3=0  pkt_w  rd, rs1, off  — write rs1 (4 octets) to TX BRAM[off]
+    //   funct3=1  pkt_s  rd, rs1       — emit first rs1 octets onto AXI-Stream
+    //   funct3=2  pkt_st rd, imm[2:0]  — read TX status field (no rs1)
+    // is_send / is_status are mutually exclusive; both 0 means pkt_w.
+    // word_offset is the BRAM offset for pkt_w, and the status field idx
+    // for pkt_st (only the low 3 bits are used there).
     typedef struct packed {
         logic          valid;
         logic [5:0]    rs1_paddr;
         logic          rs1_ready;
         logic [3:0]    word_offset;
         logic          is_send;
+        logic          is_status;
         logic [5:0]    rd_paddr;
         logic [4:0]    rd_addr;
         logic [$clog2(ROB_SIZE)-1:0] rob_index;
     } rs_pkt_tx_entry_t;
 
-    // pkt_tx FU input. data carries rs1 (the value to write for pkt_w, or
-    // the length in octets for pkt_s). The FU shares the mul/div CDB lane.
+    // pkt_tx FU input. data carries rs1 (the value to write for pkt_w, the
+    // length in octets for pkt_s). Ignored for pkt_st. The FU shares the
+    // mul/div CDB lane; pkt_st's status result rides the same lane.
     typedef struct packed {
         logic          valid;
         logic [31:0]   data;
         logic [3:0]    word_offset;
         logic          is_send;
+        logic          is_status;
         logic [5:0]    rd_paddr;
         logic [4:0]    rd_addr;
         logic [$clog2(ROB_SIZE)-1:0] rob_index;

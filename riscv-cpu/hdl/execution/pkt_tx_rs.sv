@@ -36,12 +36,19 @@ import ooo_types::*;
                       (head[$clog2(RS_SIZE)-1:0] == tail[$clog2(RS_SIZE)-1:0]);
 
     logic head_ready;
+    logic head_is_status;
     assign head_ready = !rs_empty &&
                         pt_rs_mem[head[$clog2(RS_SIZE)-1:0]].valid &&
                         pt_rs_mem[head[$clog2(RS_SIZE)-1:0]].rs1_ready;
+    // pkt_st is a pure observation read — let it bypass the staging-full
+    // stall so firmware can keep polling tx_full / tx_empty even while the
+    // FIFO is saturated. The FU treats pkt_st as a no-op against the
+    // BRAM and FSM, just snapshots status onto the CDB.
+    assign head_is_status = pt_rs_mem[head[$clog2(RS_SIZE)-1:0]].is_status;
 
-    // Issue the head when it's ready and the FU isn't busy draining a send.
-    assign rs_ready_entry = (head_ready && !stall) ?
+    // Issue when the head is ready, and either the FU has staging room
+    // (for pkt_w / pkt_s) or the head is a pkt_st.
+    assign rs_ready_entry = (head_ready && (!stall || head_is_status)) ?
                             pt_rs_mem[head[$clog2(RS_SIZE)-1:0]] : '0;
 
     always_ff @(posedge clk) begin
@@ -56,7 +63,7 @@ import ooo_types::*;
                 tail <= tail + 1'b1;
             end
 
-            if (head_ready && !stall) begin
+            if (head_ready && (!stall || head_is_status)) begin
                 pt_rs_mem[head[$clog2(RS_SIZE)-1:0]].valid <= 1'b0;
                 head <= head + 1'b1;
             end
