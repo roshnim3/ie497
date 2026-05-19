@@ -61,8 +61,6 @@ import ooo_types::*;
             rename_pkt.alu_op1_sel = decode_pkt.alu_op1_sel;
             rename_pkt.alu_op2_sel = decode_pkt.alu_op2_sel;
             rename_pkt.cmp_op      = decode_pkt.cmp_op;
-            rename_pkt.mul_op      = decode_pkt.mul_op;
-            rename_pkt.div_op      = decode_pkt.div_op;
             rename_pkt.pht_counter = decode_pkt.pht_counter;
             rename_pkt.pht_index   = decode_pkt.pht_index;
             rename_pkt.mem_type    = decode_pkt.mem_type;

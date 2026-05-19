@@ -12,8 +12,6 @@ import ooo_types::*;
     // RS full signals
     input  logic            rs_br_full,
     input  logic            rs_alu_full,
-    input  logic            rs_mul_full,
-    input  logic            rs_div_full,
     input  logic            rs_mem_full,
     input  logic            rs_ft_full,
     input  logic            rs_pt_full,
@@ -26,8 +24,6 @@ import ooo_types::*;
     // RS enqueue signals
     output rs_br_entry_t            rs_br_enq,
     output rs_alu_entry_t           rs_alu_enq,
-    output rs_mul_entry_t           rs_mul_enq,
-    output rs_div_entry_t           rs_div_enq,
     output rs_mem_entry_t           rs_mem_enq,
     output rs_fetch_trade_entry_t   rs_ft_enq,
     output rs_pkt_tx_entry_t        rs_pt_enq
@@ -47,8 +43,6 @@ import ooo_types::*;
         // Default values to prevent latches
         rs_br_enq = '0;
         rs_alu_enq = '0;
-        rs_mul_enq = '0;
-        rs_div_enq = '0;
         rs_mem_enq = '0;
         rs_ft_enq  = '0;
         rs_pt_enq  = '0;
@@ -71,28 +65,6 @@ import ooo_types::*;
                     rs_alu_enq.alu_op      = rename_pkt.alu_op;
                     rs_alu_enq.cmp_op      = rename_pkt.cmp_op;
                     rs_alu_enq.rob_index   = rename_pkt.rob_index;
-                end
-                FU_MUL: begin
-                    rs_mul_enq.valid       = 1'b1;
-                    rs_mul_enq.rs1_paddr   = rename_pkt.rs1_paddr;
-                    rs_mul_enq.rs2_paddr   = rename_pkt.rs2_paddr;
-                    rs_mul_enq.rd_paddr    = rename_pkt.rd_paddr;
-                    rs_mul_enq.rd_addr     = rename_pkt.rd_addr;
-                    rs_mul_enq.rs1_ready   = rename_pkt.rs1_ready || rs1_cdb_match;
-                    rs_mul_enq.rs2_ready   = rename_pkt.rs2_ready || rs2_cdb_match;
-                    rs_mul_enq.mul_op      = rename_pkt.mul_op;
-                    rs_mul_enq.rob_index   = rename_pkt.rob_index;
-                end
-                FU_DIV: begin
-                    rs_div_enq.valid       = 1'b1;
-                    rs_div_enq.rs1_paddr   = rename_pkt.rs1_paddr;
-                    rs_div_enq.rs2_paddr   = rename_pkt.rs2_paddr;
-                    rs_div_enq.rd_paddr    = rename_pkt.rd_paddr;
-                    rs_div_enq.rd_addr     = rename_pkt.rd_addr;
-                    rs_div_enq.rs1_ready   = rename_pkt.rs1_ready || rs1_cdb_match;
-                    rs_div_enq.rs2_ready   = rename_pkt.rs2_ready || rs2_cdb_match;
-                    rs_div_enq.div_op      = rename_pkt.div_op;
-                    rs_div_enq.rob_index   = rename_pkt.rob_index;
                 end
                 FU_BR: begin
                     rs_br_enq.valid       = rename_pkt.valid;
@@ -161,8 +133,6 @@ import ooo_types::*;
         unique case (rename_pkt.fu_flag)
             FU_BR:           rs_full = rs_br_full;
             FU_ALU:          rs_full = rs_alu_full;
-            FU_MUL:          rs_full = rs_mul_full;
-            FU_DIV:          rs_full = rs_div_full;
             FU_MEM:          rs_full = rs_mem_full;
             FU_FETCH_TRADE:  rs_full = rs_ft_full;
             FU_PKT_TX:       rs_full = rs_pt_full;

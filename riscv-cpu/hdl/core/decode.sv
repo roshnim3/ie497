@@ -62,8 +62,6 @@ import ooo_types::*;
         decode_packet_next.alu_op1_sel  = rs1_out;  // ALU operand 1 from rs1
         decode_packet_next.alu_op2_sel  = rs2_out;  // ALU operand 2 from rs2
         decode_packet_next.cmp_op       = cmp_eq;   // Default comparison operation
-        decode_packet_next.mul_op       = mul;      // Default mul operation
-        decode_packet_next.div_op       = div;      // Default div operation
         // Only use branch prediction for branch/JAL instructions
         // For non-branch instructions, force to not_taken to avoid spurious flushes
         decode_packet_next.br_pred      = not_taken;  // Will be overridden for branches
@@ -198,27 +196,22 @@ import ooo_types::*;
                 decode_packet_next.rs2_addr     = inst.r_type.rs2;
                 decode_packet_next.alu_op1_sel  = rs1_out;
                 decode_packet_next.alu_op2_sel  = rs2_out;  // Use register instead of immediate
-                decode_packet_next.fu_flag      = FU_ALU; 
-                
-                // Decode specific register operation
-                if(inst.r_type.funct7 == 7'b0000001) begin // M-extension (multiplication/division)
-                    decode_packet_next.fu_flag      = inst.r_type.funct3[2] ? FU_DIV : FU_MUL;
-                    decode_packet_next.mul_op       = mul_ops'(inst.r_type.funct3[1:0]); // MUL/DIV operation
-                    decode_packet_next.div_op       = div_ops'(inst.r_type.funct3[1:0]);
-                end else begin // Base ALU operations
-                    // Optimized: Remove unnecessary begin-end blocks
-                    unique case (inst.r_type.funct3)
-                        add:  decode_packet_next.alu_op = inst[30] ? alu_sub : alu_add;
-                        sll:  decode_packet_next.alu_op = alu_sll;
-                        slt:  decode_packet_next.cmp_op = cmp_lt;
-                        sltu: decode_packet_next.cmp_op = cmp_ltu;
-                        axor: decode_packet_next.alu_op = alu_xor;
-                        sr:   decode_packet_next.alu_op = inst[30] ? alu_sra : alu_srl;
-                        aor:  decode_packet_next.alu_op = alu_or;
-                        aand: decode_packet_next.alu_op = alu_and;
-                        default: decode_packet_next.alu_op = alu_add;
-                    endcase
-                end
+                decode_packet_next.fu_flag      = FU_ALU;
+
+                // RV32M opcodes (funct7 == 7'b0000001) fall through to the
+                // base ALU decode below; the toolchain is RV32I-only so they
+                // never appear, and any stray encoding lands on alu_add.
+                unique case (inst.r_type.funct3)
+                    add:  decode_packet_next.alu_op = inst[30] ? alu_sub : alu_add;
+                    sll:  decode_packet_next.alu_op = alu_sll;
+                    slt:  decode_packet_next.cmp_op = cmp_lt;
+                    sltu: decode_packet_next.cmp_op = cmp_ltu;
+                    axor: decode_packet_next.alu_op = alu_xor;
+                    sr:   decode_packet_next.alu_op = inst[30] ? alu_sra : alu_srl;
+                    aor:  decode_packet_next.alu_op = alu_or;
+                    aand: decode_packet_next.alu_op = alu_and;
+                    default: decode_packet_next.alu_op = alu_add;
+                endcase
             end
             // custom-1: fetch_trade rd, imm[2:0] (I-type)
             // Reads parser_output_bram[imm[2:0]] via the dedicated fetch_trade FU.

@@ -3,7 +3,7 @@
     "c_ext"       : false,
     "f_ext"       : false,
     "bmem_0_on_x" : true,
-    "dw_ip"       : ["DW02_mult","DW_mult_pipe", "DW_div_seq"],
+    "dw_ip"       : [],
     "synth": {
         "compile_ultra" : true,
         "ungroup"       : true,

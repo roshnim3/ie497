@@ -4,30 +4,12 @@ package ooo_types;
 
     localparam ROB_SIZE     = 32; // Keep ROB_SIZE as power of 2
     localparam ALU_RS_SIZE  = 16; // Keep ALU_RS_SIZE as power of 2
-    localparam MUL_RS_SIZE  = 8;  // Keep MUL_RS_SIZE as power of 2
-    localparam DIV_RS_SIZE  = 4;  // Keep DIV_RS_SIZE as power of 2
     localparam BR_RS_SIZE   = 8;  // Keep BR_RS_SIZE as power of 2
     localparam MEM_RS_SIZE  = 16; // Keep MEM_RS_SIZE as power of 2
     localparam FT_RS_SIZE   = 4;  // fetch_trade RS depth (power of 2)
     localparam PT_RS_SIZE   = 4;  // pkt_tx RS depth (power of 2)
     localparam LSQ_SIZE     = 8;  // Keep LSQ_SIZE as power of 2
     localparam FETCH_Q_SIZE = 8;  // Keep FETCH_QUEUE_SIZE as power of 2
-
-    localparam mult_a_width = 33;
-    localparam mult_b_width = 33;
-    localparam mult_num_stages = 6;
-    localparam mult_stall_mode = 0;
-    localparam mult_rst_mode = 2;
-    localparam mult_op_iso_mode = 2;
-
-    localparam div_a_width = 33;
-    localparam div_b_width = 33;
-    localparam div_tc_mode = 1;
-    localparam div_num_cyc = 20;
-    localparam div_rst_mode = 1;
-    localparam div_input_mode = 1;
-    localparam div_output_mode = 1;
-    localparam div_early_start = 0;
 
     // RVFI packet structure for RISC-V Formal Verification Interface
     typedef struct packed {
@@ -157,35 +139,12 @@ package ooo_types;
         imm_out   = 1'b1
     } alu_op2_sel_t;
 
-    typedef enum logic [1:0] {
-        mul     = 2'b00,
-        mulh    = 2'b01,
-        mulhsu  = 2'b10,
-        mulhu   = 2'b11
-    } mul_ops;
-
-    typedef enum logic [1:0] {
-        div     = 2'b00,
-        divu    = 2'b01,
-        rem     = 2'b10,
-        remu    = 2'b11
-    } div_ops;
-
-    // Divider FSM states
-    typedef enum logic [1:0] {
-        IDLE     = 2'b00,  // Waiting for new division request
-        DIVIDING = 2'b01,  // Division in progress
-        COMPLETE = 2'b10   // Division done, broadcasting result
-    } div_state_t;
-
     // Functional Unit flags, for identifying which FU's queue to send to
     typedef enum logic [2:0] {
         FU_ALU         = 3'b000,
         FU_BR          = 3'b001,
         FU_MEM         = 3'b010,
         FU_FETCH_TRADE = 3'b011, // custom-1: BRAM-backed parsed-field read
-        FU_MUL         = 3'b100,
-        FU_DIV         = 3'b101,
         FU_PKT_TX      = 3'b110  // custom-2: BRAM-backed TX primitive (pkt_w/pkt_s)
     } fu_flags;
 
@@ -235,11 +194,9 @@ package ooo_types;
         alu_op1_sel_t   alu_op1_sel;
         alu_op2_sel_t   alu_op2_sel;
         cmp_ops         cmp_op;
-        mul_ops         mul_op;
-        div_ops         div_op;
         br_pred_t       br_pred;
-        logic [1:0]     pht_counter;   
-        logic [7:0]     pht_index;     
+        logic [1:0]     pht_counter;
+        logic [7:0]     pht_index;
         mem_type_t      mem_type;
         mem_op_t        mem_op_type;
     } decode_packet_t;
@@ -261,10 +218,8 @@ package ooo_types;
         alu_op1_sel_t   alu_op1_sel;
         alu_op2_sel_t   alu_op2_sel;
         cmp_ops         cmp_op;
-        mul_ops         mul_op;
-        div_ops         div_op;
-        logic [1:0]     pht_counter;   
-        logic [7:0]     pht_index;     
+        logic [1:0]     pht_counter;
+        logic [7:0]     pht_index;
         mem_type_t      mem_type;
         mem_op_t        mem_op_type;
 
@@ -476,50 +431,6 @@ package ooo_types;
         logic [4:0]    rd_addr;
         logic [$clog2(ROB_SIZE)-1:0] rob_index;
     } fu_pkt_tx_pkt;
-
-    typedef struct packed {
-        logic           valid;
-        logic [5:0]     rs1_paddr;
-        logic [5:0]     rs2_paddr;
-        logic [5:0]     rd_paddr;
-        logic [4:0]     rd_addr;
-        logic           rs1_ready;
-        logic           rs2_ready;
-        mul_ops         mul_op;
-        logic [$clog2(ROB_SIZE)-1:0] rob_index;
-    } rs_mul_entry_t;
-
-    typedef struct packed {
-        logic          valid;
-        logic [31:0]   op_a;
-        logic [31:0]   op_b;
-        mul_ops        mul_op;
-        logic [$clog2(ROB_SIZE)-1:0] rob_index;
-        logic [5:0]    rd_paddr;
-        logic [4:0]    rd_addr;
-    } fu_mul_pkt;
-
-    typedef struct packed {
-        logic           valid;
-        logic [5:0]     rs1_paddr;
-        logic [5:0]     rs2_paddr;
-        logic [5:0]     rd_paddr;
-        logic [4:0]     rd_addr;
-        logic           rs1_ready;
-        logic           rs2_ready;
-        div_ops         div_op;
-        logic [$clog2(ROB_SIZE)-1:0] rob_index;
-    } rs_div_entry_t;
-
-    typedef struct packed {
-        logic          valid;
-        logic [31:0]   op_a;
-        logic [31:0]   op_b;
-        div_ops        div_op;
-        logic [$clog2(ROB_SIZE)-1:0] rob_index;
-        logic [5:0]    rd_paddr;
-        logic [4:0]    rd_addr;
-    } fu_div_pkt;
 
     typedef struct packed {
         logic           valid;

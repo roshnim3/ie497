@@ -21,19 +21,8 @@ module prf (
     input logic             alu_br_pd_wen,
     input logic [31:0]      alu_br_pd_wdata,
 
-    // MUL ports (read)
-    input logic  [5:0]      mul_ps1_addr,
-    input logic  [5:0]      mul_ps2_addr,
-    output logic [31:0]     mul_pr1_data,
-    output logic [31:0]     mul_pr2_data,
-    
-    // DIV ports (read)
-    input logic  [5:0]      div_ps1_addr,
-    input logic  [5:0]      div_ps2_addr,
-    output logic [31:0]     div_pr1_data,
-    output logic [31:0]     div_pr2_data,
-
-    // MUL_DIV shared write port (from combined CDB)
+    // Shared custom-FU write port (fetch_trade, pkt_tx — retains the
+    // mul_div_* naming from the RV32M era to minimize diff noise)
     input logic  [5:0]      mul_div_pd_addr,
     input logic             mul_div_pd_wen,
     input logic [31:0]      mul_div_pd_wdata,
@@ -79,10 +68,6 @@ module prf (
     assign br_pr2_data  = registers[br_ps2_addr];
     assign alu_pr1_data = registers[alu_ps1_addr];
     assign alu_pr2_data = registers[alu_ps2_addr];
-    assign mul_pr1_data = registers[mul_ps1_addr];
-    assign mul_pr2_data = registers[mul_ps2_addr];
-    assign div_pr1_data = registers[div_ps1_addr];
-    assign div_pr2_data = registers[div_ps2_addr];
     assign mem_pr1_data = registers[mem_ps1_addr];
     assign mem_pr2_data = registers[mem_ps2_addr];
     assign pt_pr1_data  = registers[pt_ps1_addr];

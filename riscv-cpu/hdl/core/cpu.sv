@@ -145,16 +145,12 @@ import ooo_types::*;
     // Reservation station signals
     logic           rs_br_full, rs_br_empty;
     logic           rs_alu_full, rs_alu_empty;
-    logic           rs_mul_full, rs_mul_empty;
-    logic           rs_div_full, rs_div_empty;
     logic           rs_mem_full, rs_mem_empty;
     logic           rs_ft_full,  rs_ft_empty;
     logic           rs_pt_full,  rs_pt_empty;
 
     rs_br_entry_t           rs_br_enq;
     rs_alu_entry_t          rs_alu_enq;
-    rs_mul_entry_t          rs_mul_enq;
-    rs_div_entry_t          rs_div_enq;
     rs_mem_entry_t          rs_mem_enq;
     rs_fetch_trade_entry_t  rs_ft_enq;
     rs_pkt_tx_entry_t       rs_pt_enq;
@@ -171,10 +167,6 @@ import ooo_types::*;
 
     rs_alu_entry_t  rs_alu_ready_entry;
 
-    rs_mul_entry_t  rs_mul_ready_entry;
-
-    rs_div_entry_t  rs_div_ready_entry;
-
     rs_mem_entry_t  rs_mem_ready_entry;
 
     rs_fetch_trade_entry_t  rs_ft_ready_entry;
@@ -187,17 +179,12 @@ import ooo_types::*;
     cdb_br_pkt      cdb_br;
     cdb_alu_pkt     cdb_alu, cdb_alu_latched;
     cdb_alu_br_pkt  cdb_alu_br;
-    cdb_mul_div_pkt cdb_mul;
-    cdb_mul_div_pkt cdb_div;
     cdb_mul_div_pkt cdb_mul_div;
-    cdb_mul_div_pkt cdb_mul_buf_dout;
-    logic           cdb_mul_buf_enq, cdb_mul_buf_deq;
-    logic           cdb_mul_buf_full, cdb_mul_buf_empty;
-    cdb_mul_div_pkt cdb_trade;                  // fetch_trade FU output, shares mul/div lane
+    cdb_mul_div_pkt cdb_trade;                  // fetch_trade FU output on shared CDB lane
     cdb_mul_div_pkt cdb_trade_buf_dout;
     logic           cdb_trade_buf_enq, cdb_trade_buf_deq;
     logic           cdb_trade_buf_full, cdb_trade_buf_empty;
-    cdb_mul_div_pkt cdb_pkt_tx;                 // pkt_tx FU output, shares mul/div lane
+    cdb_mul_div_pkt cdb_pkt_tx;                 // pkt_tx FU output on shared CDB lane
     cdb_mul_div_pkt cdb_pkt_tx_buf_dout;
     logic           cdb_pkt_tx_buf_enq, cdb_pkt_tx_buf_deq;
     logic           cdb_pkt_tx_buf_full, cdb_pkt_tx_buf_empty;
@@ -230,12 +217,6 @@ import ooo_types::*;
     logic  [31:0]   alu_pr1_data, alu_pr2_data;
     fu_alu_pkt      alu_pkt;
 
-    logic [31:0]    mul_pr1_data, mul_pr2_data;
-    fu_mul_pkt      mul_pkt;
-
-    logic [31:0]    div_pr1_data, div_pr2_data;
-    fu_div_pkt      div_pkt;
-
     logic [31:0]    mem_pr1_data, mem_pr2_data;
     fu_mem_pkt      mem_pkt;
     logic           fu_mem_ready;
@@ -247,8 +228,7 @@ import ooo_types::*;
     logic [31:0]    addr_data_addr;
     logic [31:0]    addr_data_data;
 
-    logic           div_complete;
-    
+
     // Debug: monitor mem_pkt    // Memory flush: only flush memory pipeline when jumping to different cache line
     // I-stack can flush independently, D-stack must wait if cache is busy (e.g., writeback)
     assign i_mem_flush = flush[0] ? (i_stage_addr[31:5] != rob_head_entry[0].branch_target[31:5]) : flush[1] ? (i_stage_addr[31:5] != rob_head_entry[1].branch_target[31:5]) : 1'b0;
@@ -356,32 +336,11 @@ import ooo_types::*;
             cdb_alu_latched <= '0;
     end
 
-    // MUL result buffer to survive cycles where DIV has priority
-    assign cdb_mul_buf_enq = cdb_mul.valid && (cdb_div.valid || !cdb_mul_buf_empty);
-    assign cdb_mul_buf_deq = !cdb_div.valid && !cdb_mul_buf_empty;
-
-    queue #(
-        .DATA_WIDTH($bits(cdb_mul_div_pkt)),
-        .QUEUE_SIZE(4)
-    ) mul_result_buffer (
-        .clk    (clk),
-        .rst    (rst),
-        .flush  ((|flush)),
-        .enq    (cdb_mul_buf_enq && !cdb_mul_buf_full),
-        .deq    (cdb_mul_buf_deq),
-        .din    (cdb_mul),
-        .dout   (cdb_mul_buf_dout),
-        .full   (cdb_mul_buf_full),
-        .empty  (cdb_mul_buf_empty)
-    );
-
-    // fetch_trade buffers behind mul on the same CDB lane. In HFT workload
-    // mul/div are idle, so trade never hits the buffer; the queue is here for
-    // correctness in mixed workloads.
-    assign cdb_trade_buf_enq = cdb_trade.valid &&
-                               (cdb_div.valid || !cdb_mul_buf_empty || cdb_mul.valid || !cdb_trade_buf_empty);
-    assign cdb_trade_buf_deq = !cdb_div.valid && cdb_mul_buf_empty &&
-                               !cdb_mul.valid && !cdb_trade_buf_empty;
+    // RV32M stripped — the shared cdb_mul_div lane is now just trade > pkt_tx.
+    // The lane name + packet type are preserved to minimize diff noise; the
+    // mul/div producers and their result buffers are gone.
+    assign cdb_trade_buf_enq = cdb_trade.valid && !cdb_trade_buf_empty;
+    assign cdb_trade_buf_deq = !cdb_trade_buf_empty;
 
     queue #(
         .DATA_WIDTH($bits(cdb_mul_div_pkt)),
@@ -398,13 +357,10 @@ import ooo_types::*;
         .empty  (cdb_trade_buf_empty)
     );
 
-    // pkt_tx queues behind trade on the same CDB lane. Same rationale —
-    // mul/div idle in HFT workload, but the queue handles the rare collision.
+    // pkt_tx queues behind trade on the same CDB lane.
     assign cdb_pkt_tx_buf_enq = cdb_pkt_tx.valid &&
-                                (cdb_div.valid || !cdb_mul_buf_empty || cdb_mul.valid ||
-                                 !cdb_trade_buf_empty || cdb_trade.valid || !cdb_pkt_tx_buf_empty);
-    assign cdb_pkt_tx_buf_deq = !cdb_div.valid && cdb_mul_buf_empty && !cdb_mul.valid &&
-                                cdb_trade_buf_empty && !cdb_trade.valid && !cdb_pkt_tx_buf_empty;
+                                (!cdb_trade_buf_empty || cdb_trade.valid || !cdb_pkt_tx_buf_empty);
+    assign cdb_pkt_tx_buf_deq = cdb_trade_buf_empty && !cdb_trade.valid && !cdb_pkt_tx_buf_empty;
 
     queue #(
         .DATA_WIDTH($bits(cdb_mul_div_pkt)),
@@ -421,18 +377,9 @@ import ooo_types::*;
         .empty  (cdb_pkt_tx_buf_empty)
     );
 
-    // MUL/DIV/TRADE/PKT_TX CDB arbiter — DIV > mul_buf > MUL > trade_buf > TRADE > pkt_tx_buf > PKT_TX
+    // CDB arbiter — trade_buf > TRADE > pkt_tx_buf > PKT_TX
     always_comb begin
-        if (cdb_div.valid) begin
-            cdb_mul_div = cdb_div;
-        end
-        else if (!cdb_mul_buf_empty) begin
-            cdb_mul_div = cdb_mul_buf_dout;
-        end
-        else if (cdb_mul.valid) begin
-            cdb_mul_div = cdb_mul;
-        end
-        else if (!cdb_trade_buf_empty) begin
+        if (!cdb_trade_buf_empty) begin
             cdb_mul_div = cdb_trade_buf_dout;
         end
         else if (cdb_trade.valid) begin
@@ -446,54 +393,6 @@ import ooo_types::*;
         end
         else begin
             cdb_mul_div = '0;
-        end
-    end
-
-    div div_unit (
-        .clk            (clk),
-        .rst            (rst),
-        .flush          ((|flush)),
-        .div_pkt        (div_pkt),
-        .div_complete   (div_complete),
-        .cdb_div        (cdb_div)
-        
-    );
-
-    always_comb begin
-        if (rs_div_ready_entry.valid & rs_div_ready_entry.rs1_ready & rs_div_ready_entry.rs2_ready) begin
-            div_pkt.valid = 1'b1;
-            div_pkt.op_a = div_pr1_data;
-            div_pkt.op_b = div_pr2_data;
-            div_pkt.div_op = rs_div_ready_entry.div_op;
-            div_pkt.rd_paddr = rs_div_ready_entry.rd_paddr;
-            div_pkt.rd_addr = rs_div_ready_entry.rd_addr;
-            div_pkt.rob_index = rs_div_ready_entry.rob_index;
-        end
-        else begin
-            div_pkt = '0;
-        end
-    end
-
-    mul mul_unit (
-        .clk            (clk),
-        .rst            (rst),
-        .flush          ((|flush)),
-        .mul_pkt        (mul_pkt),
-        .cdb_mul        (cdb_mul)
-    );
-
-    always_comb begin
-        if (rs_mul_ready_entry.valid & rs_mul_ready_entry.rs1_ready & rs_mul_ready_entry.rs2_ready) begin
-            mul_pkt.valid = 1'b1;
-            mul_pkt.op_a = mul_pr1_data;
-            mul_pkt.op_b = mul_pr2_data;
-            mul_pkt.mul_op = rs_mul_ready_entry.mul_op;
-            mul_pkt.rd_paddr = rs_mul_ready_entry.rd_paddr;
-            mul_pkt.rd_addr = rs_mul_ready_entry.rd_addr;
-            mul_pkt.rob_index = rs_mul_ready_entry.rob_index;
-        end
-        else begin
-            mul_pkt = '0;
         end
     end
 
@@ -659,16 +558,6 @@ import ooo_types::*;
         .alu_br_pd_wen      (cdb_alu_br.valid),
         .alu_br_pd_wdata    (cdb_alu_br.result),
 
-        .mul_ps1_addr       (rs_mul_ready_entry.rs1_paddr),
-        .mul_ps2_addr       (rs_mul_ready_entry.rs2_paddr),
-        .mul_pr1_data       (mul_pr1_data),
-        .mul_pr2_data       (mul_pr2_data),
-
-        .div_ps1_addr       (rs_div_ready_entry.rs1_paddr),
-        .div_ps2_addr       (rs_div_ready_entry.rs2_paddr),
-        .div_pr1_data       (div_pr1_data),
-        .div_pr2_data       (div_pr2_data),
-
         .mul_div_pd_addr    (cdb_mul_div.rd_paddr),
         .mul_div_pd_wen     (cdb_mul_div.valid),
         .mul_div_pd_wdata   (cdb_mul_div.result),
@@ -703,41 +592,6 @@ import ooo_types::*;
         .rs_full            (rs_alu_full),
         .rs_empty           (rs_alu_empty),
         .rs_ready_entry     (rs_alu_ready_entry)
-    );
-
-    mul_rs #(
-        .RS_SIZE       (MUL_RS_SIZE)
-    )
-    mul_res_station (
-        .clk                (clk),
-        .rst                (rst),
-        .flush              ((|flush)),
-        .cdb_alu_br_wakeup  (cdb_alu_br_wakeup),
-        .cdb_mul_div_wakeup (cdb_mul_div_wakeup),
-        .cdb_mem_wakeup     (cdb_mem_wakeup),
-        .new_entry          (rs_mul_enq),
-
-        .rs_full            (rs_mul_full),
-        .rs_empty           (rs_mul_empty),
-        .rs_ready_entry     (rs_mul_ready_entry)
-    );
-
-    div_rs #(
-        .RS_SIZE       (DIV_RS_SIZE)
-    )
-    div_res_station (
-        .clk                (clk),
-        .rst                (rst),
-        .flush              ((|flush)),
-        .cdb_alu_br_wakeup  (cdb_alu_br_wakeup),
-        .cdb_mul_div_wakeup (cdb_mul_div_wakeup),
-        .cdb_mem_wakeup     (cdb_mem_wakeup),
-        .new_entry          (rs_div_enq),
-        .div_complete       (div_complete),
-
-        .rs_full            (rs_div_full),
-        .rs_empty           (rs_div_empty),
-        .rs_ready_entry     (rs_div_ready_entry)
     );
 
     br_rs #(
@@ -851,8 +705,6 @@ import ooo_types::*;
         // RS full inputs
         .rs_br_full             (rs_br_full),
         .rs_alu_full            (rs_alu_full),
-        .rs_mul_full            (rs_mul_full),
-        .rs_div_full            (rs_div_full),
         .rs_mem_full            (rs_mem_or_lsq_full),  // Combined RS+LSQ full signal
         .rs_ft_full             (rs_ft_full),
         .rs_pt_full             (rs_pt_full),
@@ -863,8 +715,6 @@ import ooo_types::*;
         // RS enqueue outputs
         .rs_br_enq              (rs_br_enq),
         .rs_alu_enq             (rs_alu_enq),
-        .rs_mul_enq             (rs_mul_enq),
-        .rs_div_enq             (rs_div_enq),
         .rs_mem_enq             (rs_mem_enq),
         .rs_ft_enq              (rs_ft_enq),
         .rs_pt_enq              (rs_pt_enq),
