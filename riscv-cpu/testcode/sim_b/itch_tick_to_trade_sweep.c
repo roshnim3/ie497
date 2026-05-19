@@ -1,34 +1,20 @@
-// Sim B — tick-to-trade closed loop.
+// Sim B — tick-to-trade with packet-length sweep.
 //
-// Streams 100 ITCH-like trades from the behavioral parser, runs the
-// decision (mtype=='A' && price>THRESHOLD_PRICE && shares>=MIN_SHARES),
-// and on accept builds a 64-octet Ethernet/IPv4/UDP/OUCH frame in the TX
-// BRAM and triggers pkt_s. On reject the firmware just pops and moves on.
+// Same workload as itch_tick_to_trade.c (poll parser, decide, emit on
+// accept) but cycles the pkt_s length through {16, 32, 48, 64} octets per
+// accepted iteration. The decision logic and 16-pkt_w buffer-fill are
+// identical across all lengths — only the length operand passed to pkt_s
+// changes. Expectation: TX drain segment scales linearly with len/4 (one
+// AXI-Stream beat per 32b word), the other waterfall segments (rx_wait,
+// decision, tx_issue) stay flat.
 //
-// Tracked end-to-end paths:
-//   parser BRAM commit  -->  fetch_trade FU read  -->  decision branch
-//     -->  16 pkt_w + pkt_s(64)  -->  AXI-Stream first beat at the sink.
-// Testbench timestamps parser_commit and first AXI-Stream beat per
-// accepted packet and writes tick_to_trade_latency.csv.
-//
-// The fetch_trade FU comes up with packet 0 preloaded (MEMORY_INIT_PARAM,
-// seq=1) before the parser writes its first packet (seq=2 onward). The
-// preloaded slot has no parser_commit pulse, so we drop it before the
-// metric loop — that keeps every PACKET_DONE the testbench sees aligned
-// with the parser packet whose write_ts[] entry produced it.
-//
-// Frame layout (64 octets, network byte order):
-//   bytes 00..05  Ethernet dst MAC  02:00:00:00:00:01
-//   bytes 06..11  Ethernet src MAC  02:00:00:00:00:02
-//   bytes 12..13  Ethertype         0x0800 (IPv4)
-//   bytes 14..33  IPv4 header       proto=17, src=10.0.0.2, dst=10.0.0.1
-//   bytes 34..41  UDP header        src=0xABCD, dst=0x1234, len=30
-//   bytes 42..63  OUCH-style body   msg='O' side='B' token qty price
-//                                   locate TIF='I' display='Y' pad
+// Each accept's full waterfall lands in tick_to_trade_breakdown.csv;
+// length per row can be recovered from tx_packets.csv (`length` column)
+// or computed as LENGTHS[accept_idx & 3].
 //
 // Run:
 //   make EXTRA_VCS_FLAGS="+define+ECE411_NO_SPIKE_DPI" run_vcs_top_tb \
-//        PROG=../testcode/sim_b/itch_tick_to_trade.c \
+//        PROG=../testcode/sim_b/itch_tick_to_trade_sweep.c \
 //        TIMEOUT=5000000 \
 //        EXTRA_RUN_ARGS="+PARSER_ENABLE_ECE411=1 +PARSER_INTERVAL_ECE411=512"
 
@@ -55,8 +41,6 @@
 
 #define PACKET_DONE() asm volatile ("slti x0, x0, 7" ::: "memory")
 
-// RISC-V base ISA has no native bswap. Used to swap rs1-native little-
-// endian values into the network byte order the OUCH body expects.
 static inline uint32_t bswap32(uint32_t x) {
     return ((x & 0x000000FFu) << 24) |
            ((x & 0x0000FF00u) <<  8) |
@@ -64,24 +48,9 @@ static inline uint32_t bswap32(uint32_t x) {
            ((x & 0xFF000000u) >> 24);
 }
 
-// Pre-computed constant header words. Names follow the BRAM word offset.
-// Each constant encodes 4 octets in transmission order packed LSB-first
-// (PKT_W's payload becomes bytes [7:0]=octet0, [15:8]=octet1, ...).
-//
-// On-wire bytes  =>  constant value
-// Word  0: 02 00 00 00          -> 0x00000002
-// Word  1: 00 01 02 00          -> 0x00020100
-// Word  2: 00 00 00 02          -> 0x02000000
-// Word  3: 08 00 45 00          -> 0x00450008
-// Word  4: 00 32 00 01          -> 0x01003200
-// Word  5: 40 00 40 11          -> 0x11400040
-// Word  6: 00 00 0A 00          -> 0x000A0000
-// Word  7: 00 02 0A 00          -> 0x000A0200
-// Word  8: 00 01 AB CD          -> 0xCDAB0100
-// Word  9: 12 34 00 1E          -> 0x1E003412
-// Word 10: 00 00 'O' 'B'        -> 0x424F0000  (0x42='B', 0x4F='O')
-// Word 14: 00 00 'I' 'Y'        -> 0x59490000  (0x49='I', 0x59='Y')
-// Word 15: 00 00 00 00          -> 0x00000000
+// Same header words as itch_tick_to_trade.c — see that file for the
+// per-byte layout. The frame is always built to 64 octets; pkt_s len just
+// changes how many words the FSM drains.
 #define HDR_W0   0x00000002u
 #define HDR_W1   0x00020100u
 #define HDR_W2   0x02000000u
@@ -96,9 +65,6 @@ static inline uint32_t bswap32(uint32_t x) {
 #define HDR_W14  0x59490000u
 #define HDR_W15  0x00000000u
 
-// Tohost-style counters readable from the simulation memory dump or by
-// peeking the d-cache state. The testbench also computes parsed / emitted
-// independently from write_idx and tx_idx so these are mostly for sanity.
 volatile uint32_t parsed_count   __attribute__((aligned(32))) = 0;
 volatile uint32_t accept_count   __attribute__((aligned(32))) = 0;
 volatile uint32_t reject_count   __attribute__((aligned(32))) = 0;
@@ -108,23 +74,17 @@ void main(void) {
     uint32_t accepts = 0;
     uint32_t rejects = 0;
 
+    // Length cycle. Compile-time-constant array picked up via &3 below.
+    static const uint32_t LENGTHS[4] = {16u, 32u, 48u, 64u};
+
     asm volatile ("slti x0, x0, 1" ::: "memory");
 
-    // Drop the preloaded slot (MEMORY_INIT_PARAM packet, no parser
-    // commit). No PACKET_DONE so the testbench's commit_idx stays
-    // aligned with parser packet idx.
+    // Drop preloaded slot (no PACKET_DONE, see itch_tick_to_trade.c).
     while (FETCH_TRADE(4)) {
     }
     (void)FETCH_TRADE(5);
 
-    // Warmup iteration — consume one parser packet AND emit a full TX
-    // frame regardless of the decision. The user-spec'd "skip pkt_s"
-    // warmup only trains the reject-branch / no-emit path; first accept
-    // still pays a BP-misprediction tax and a cold pkt_tx_rs traversal.
-    // Running the entire accept-emit path here trains the BP on the
-    // 16-PKT_W stream and primes the TX BRAM, the pkt_tx_rs, and the
-    // CDB lane. Cost: one extra row in tx_packets.csv at accept_idx 0
-    // (decoder still validates it).
+    // Warmup iteration — emits a 64-octet frame to train BP / prime FU.
     {
         uint32_t mtype, side, seq, shares, price;
         while (FETCH_TRADE(4)) {
@@ -159,7 +119,6 @@ void main(void) {
     }
 
     for (uint32_t i = 0; i < N_PACKETS; i++) {
-        // Spin while the FIFO is empty (slot 4 returns 1 if empty).
         while (FETCH_TRADE(4)) {
         }
 
@@ -175,6 +134,8 @@ void main(void) {
                        && (shares >= MIN_SHARES);
 
         if (accept) {
+            uint32_t len = LENGTHS[accepts & 0x3u];
+
             PKT_W(HDR_W0,   0);
             PKT_W(HDR_W1,   1);
             PKT_W(HDR_W2,   2);
@@ -186,24 +147,19 @@ void main(void) {
             PKT_W(HDR_W8,   8);
             PKT_W(HDR_W9,   9);
             PKT_W(HDR_W10, 10);
-
-            // OUCH body — multi-byte fields are network byte order.
-            PKT_W(bswap32(seq),    11);   // order token
-            PKT_W(bswap32(shares), 12);   // quantity
-            PKT_W(bswap32(price),  13);   // price
-
+            PKT_W(bswap32(seq),    11);
+            PKT_W(bswap32(shares), 12);
+            PKT_W(bswap32(price),  13);
             PKT_W(HDR_W14, 14);
             PKT_W(HDR_W15, 15);
 
-            PKT_S(64u);
+            PKT_S(len);
             accepts++;
         } else {
             rejects++;
         }
 
-        // Pop the head packet (advance FIFO tail).
         (void)FETCH_TRADE(5);
-
         PACKET_DONE();
     }
 

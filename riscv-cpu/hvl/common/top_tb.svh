@@ -196,6 +196,122 @@
         end
     end
 
+    // ---- Tick-to-trade waterfall ----
+    // Per-iteration timestamps, indexed by commit_idx at PACKET_DONE
+    // commit time. Each row in tick_to_trade_breakdown.csv is one
+    // accepted iteration; we skip iterations with no TX event (warmup or
+    // rejected). Events go into a pending buffer that resets on each
+    // parser_commit pulse (start of a new iteration window) and is
+    // finalized into the slot when that iteration's PACKET_DONE commits.
+    // Using cdb_trade.valid (instead of rs_ft_enq.valid) for the FT
+    // signals avoids attributing speculatively-dispatched-then-flushed
+    // FT instructions — cdb_trade only fires for completions.
+    longint t_ft_dispatch    [LATENCY_LOG_SIZE];  // first cdb_trade.valid after parser_commit
+    longint t_ft_commit      [LATENCY_LOG_SIZE];  // last cdb_trade.valid in iter
+    longint t_pkts_dispatch  [LATENCY_LOG_SIZE];  // first pkt_s entry into pkt_tx_rs
+    longint t_pkts_fsm_start [LATENCY_LOG_SIZE];  // FSM IDLE->SEND (last cycle in IDLE)
+    longint t_tx_first_beat  [LATENCY_LOG_SIZE];  // first AXI-Stream beat
+    longint t_tx_last_beat   [LATENCY_LOG_SIZE];  // tlast
+
+    longint pending_t_ft_dispatch;
+    longint pending_t_ft_commit;
+    longint pending_t_pkts_dispatch;
+    longint pending_t_pkts_fsm_start;
+    longint pending_t_tx_first_beat;
+
+    // tlast fires AFTER iter K's PACKET_DONE commits (the FSM drains in
+    // parallel with the next iter's processing), so it can't go through
+    // the pending+finalize path. Capture it directly using the iter index
+    // saved at first-beat time.
+    logic   tx_active;
+    int     tx_active_iter;
+
+    initial begin
+        for (int i = 0; i < LATENCY_LOG_SIZE; i++) begin
+            t_ft_dispatch[i]    = -64'sd1;
+            t_ft_commit[i]      = -64'sd1;
+            t_pkts_dispatch[i]  = -64'sd1;
+            t_pkts_fsm_start[i] = -64'sd1;
+            t_tx_first_beat[i]  = -64'sd1;
+            t_tx_last_beat[i]   = -64'sd1;
+        end
+        pending_t_ft_dispatch    = -64'sd1;
+        pending_t_ft_commit      = -64'sd1;
+        pending_t_pkts_dispatch  = -64'sd1;
+        pending_t_pkts_fsm_start = -64'sd1;
+        pending_t_tx_first_beat  = -64'sd1;
+        tx_active                = 1'b0;
+        tx_active_iter           = 0;
+    end
+
+    // Capture into pending buffer, reset on parser_commit, finalize on
+    // PACKET_DONE commit. NBA read order means a finalize on the same
+    // cycle as a parser_commit reads the pre-reset pending values.
+    always @(posedge clk) begin
+        if (!rst) begin
+            if (fake_parser.commit) begin
+                pending_t_ft_dispatch    <= -64'sd1;
+                pending_t_ft_commit      <= -64'sd1;
+                pending_t_pkts_dispatch  <= -64'sd1;
+                pending_t_pkts_fsm_start <= -64'sd1;
+                pending_t_tx_first_beat  <= -64'sd1;
+            end else begin
+                if (dut.cdb_trade.valid) begin
+                    if (pending_t_ft_dispatch == -64'sd1)
+                        pending_t_ft_dispatch <= cycle_count;
+                    // Only update ft_commit while pkt_s hasn't dispatched
+                    // yet — keeps the pop's cdb_trade (slot 5) from
+                    // overwriting the price read's commit.
+                    if (pending_t_pkts_dispatch == -64'sd1)
+                        pending_t_ft_commit <= cycle_count;
+                end
+                if (dut.rs_pt_enq.valid && dut.rs_pt_enq.is_send
+                    && pending_t_pkts_dispatch == -64'sd1) begin
+                    pending_t_pkts_dispatch <= cycle_count;
+                end
+                if (dut.pkt_tx_unit.state == 1'b0 && dut.pkt_tx_unit.state_n == 1'b1
+                    && pending_t_pkts_fsm_start == -64'sd1) begin
+                    pending_t_pkts_fsm_start <= cycle_count;
+                end
+                if (pkt_tx_tvalid && pkt_tx_tready
+                    && pending_t_tx_first_beat == -64'sd1) begin
+                    pending_t_tx_first_beat <= cycle_count;
+                end
+            end
+
+            // Finalize on PACKET_DONE commit (commit_idx read here is the
+            // pre-increment value = iteration index).
+            if (dut.commit[0] && dut.rob_head_entry[0].inst == PACKET_DONE_MARKER
+                && commit_idx < LATENCY_LOG_SIZE) begin
+                t_ft_dispatch[commit_idx]    <= pending_t_ft_dispatch;
+                t_ft_commit[commit_idx]      <= pending_t_ft_commit;
+                t_pkts_dispatch[commit_idx]  <= pending_t_pkts_dispatch;
+                t_pkts_fsm_start[commit_idx] <= pending_t_pkts_fsm_start;
+                t_tx_first_beat[commit_idx]  <= pending_t_tx_first_beat;
+            end
+            if (dut.commit[1] && dut.rob_head_entry[1].inst == PACKET_DONE_MARKER
+                && commit_idx < LATENCY_LOG_SIZE) begin
+                t_ft_dispatch[commit_idx]    <= pending_t_ft_dispatch;
+                t_ft_commit[commit_idx]      <= pending_t_ft_commit;
+                t_pkts_dispatch[commit_idx]  <= pending_t_pkts_dispatch;
+                t_pkts_fsm_start[commit_idx] <= pending_t_pkts_fsm_start;
+                t_tx_first_beat[commit_idx]  <= pending_t_tx_first_beat;
+            end
+
+            // tlast capture — uses the iter index claimed at first beat.
+            if (pkt_tx_tvalid && pkt_tx_tready) begin
+                if (!tx_active && commit_idx < LATENCY_LOG_SIZE) begin
+                    tx_active_iter <= commit_idx;
+                    tx_active      <= 1'b1;
+                end
+                if (pkt_tx_tlast && tx_active_iter < LATENCY_LOG_SIZE) begin
+                    t_tx_last_beat[tx_active_iter] <= cycle_count;
+                    tx_active                      <= 1'b0;
+                end
+            end
+        end
+    end
+
     `include "rvfi_reference.svh"
 
     // Branch Prediction Accuracy Monitor
@@ -297,6 +413,45 @@
                 $fclose(fd_tt);
                 $display("Tick-to-trade: %0d accepted frames logged to tick_to_trade_latency.csv (tx_idx=%0d)",
                          dumped, tx_idx);
+            end
+
+            // Full waterfall: one row per accepted iteration, with all
+            // 7 timestamps + the canonical deltas. Skip iterations that
+            // had no TX event (warmup or rejected).
+            if (parser_enable && tx_idx > 0) begin
+                int     fd_br;
+                int     br_accept_idx;
+                int     n_iters;
+                int     k_br;
+                longint pc, fd_, fc, pd, fs, fb, lb;
+                fd_br         = $fopen("tick_to_trade_breakdown.csv", "w");
+                br_accept_idx = 0;
+                n_iters       = (commit_idx < LATENCY_LOG_SIZE) ? commit_idx : LATENCY_LOG_SIZE;
+                $fdisplay(fd_br, "accept_idx,parser_idx,t_parser_commit,t_ft_dispatch,t_ft_commit,t_pkts_dispatch,t_pkts_fsm_start,t_tx_first_beat,t_tx_last_beat,rx_wait,decision,tx_issue,tx_drain,total");
+                for (k_br = 0; k_br < n_iters; k_br++) begin
+                    if (t_tx_first_beat[k_br] >= 0 && k_br < write_idx) begin
+                        pc  = write_ts[k_br];
+                        fd_ = t_ft_dispatch[k_br];
+                        fc  = t_ft_commit[k_br];
+                        pd  = t_pkts_dispatch[k_br];
+                        fs  = t_pkts_fsm_start[k_br];
+                        fb  = t_tx_first_beat[k_br];
+                        lb  = t_tx_last_beat[k_br];
+                        $fdisplay(fd_br, "%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d",
+                                  br_accept_idx,
+                                  k_br,
+                                  pc, fd_, fc, pd, fs, fb, lb,
+                                  fd_ - pc,        // rx_wait
+                                  pd  - fc,        // decision
+                                  fs  - pd,        // tx_issue
+                                  lb  - fb + 1,    // tx_drain (beats)
+                                  lb  - pc);       // total
+                        br_accept_idx++;
+                    end
+                end
+                $fclose(fd_br);
+                $display("Tick-to-trade waterfall: %0d rows logged to tick_to_trade_breakdown.csv",
+                         br_accept_idx);
             end
             $finish;
         end
