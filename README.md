@@ -65,12 +65,16 @@ vivado -mode batch -source ./build.tcl -tclargs \
 
 # === ON THE FPGA HOST (hft03) ===
 
-# (4) Install root-owned wrappers + sudoers rule. One-time per host.   see §5.1, §4
+# (4a) Install the four root-owned wrappers. One-time per host.       see §5.1
 sudo install -m 0755 -o root -g root open-nic-shell/script/setup_device.sh  /usr/local/bin/setup_open_nic_device
 sudo install -m 0755 -o root -g root open-nic-shell/script/program_fpga.sh  /usr/local/bin/program_open_nic_fpga
 sudo install -m 0755 -o root -g root open-nic-shell/script/bar_read.py      /usr/local/bin/bar_read
 sudo install -m 0755 -o root -g root open-nic-shell/script/bar_write.py     /usr/local/bin/bar_write
-# Sudoers file goes to /etc/sudoers.d/sp26-ie497-dl-grp01 — see §4.1 for contents.
+
+# (4b) Sudoers rule: this step is performed by the lab administrator,    see §4.1
+#      NOT by the commands in (4a). Ask the course instructor to install
+#      /etc/sudoers.d/sp26-ie497-dl-grp01 with the contents given in §4.1
+#      and to add your account to the sp26-ie497-dl-grp01 Unix group.
 
 # (5) Program the FPGA.                                              see §9
 export EXTENDED_DEVICE_BDF1=0000:83:00.0
@@ -638,7 +642,7 @@ The OpenNIC half of the project advanced through four discrete strides, each of 
 
 **1. Getting OpenNIC built and flashed on a U55C at all.** Last year in IE421, our team attempted to build and program OpenNIC onto the FPGA and was unsuccessful. Our first major stride was getting Vivado configured with the correct board files, the CMAC IP license obtained, `program_fpga.sh` and `setup_device.sh` exercised against `hft03`'s PCIe bridge, the `onic` kernel module loaded, and a netdev (`ens2`) appearing in `ip link`. This stride alone took multiple weeks and required coordination with course staff on sudoers configuration, license-server access, and PCIe bridge enable bits. **End state: a stock OpenNIC bitstream programmed onto `hft03`'s U55C, the host enumerating the device, and a 100-gigabit Ethernet interface visible to the operating system.**
 
-**2. Integrating the custom parser plugin into Box1.** Once the framework was demonstrably working, we wrote and integrated `plugin/p2p/packetparser_322mhz_simple.sv` — a TITCH/MoldUDP64 parser that snoops the CMAC RX AXI-Stream, decodes the Ethernet / IPv4 / UDP / MoldUDP64 / ITCH layered protocol stack in hardware, and exposes the decoded fields as named module outputs. T
+**2. Integrating the custom parser plugin into Box1.** Once the framework was demonstrably working, we wrote and integrated `plugin/p2p/packetparser_322mhz_simple.sv` — a Tier-3-capable ITCH/MoldUDP64 parser that snoops the CMAC RX AXI-Stream, decodes the Ethernet / IPv4 / UDP / MoldUDP64 / ITCH layered protocol stack in hardware, and exposes the decoded fields as named module outputs.
 
 **3. Adding the AXI-Lite register interface.** To make the parsed fields readable from host software, we added the 28-register AXI-Lite block in `plugin/p2p/p2p_322mhz.sv` (later extended to 33 registers as the diagnostic counters in §13.4 were added during bring-up) and wired it into OpenNIC's BAR2 address space at offset `0x200000`. This is the interface between hardware and software: a single 32-bit memory-mapped load from the host returns the most recently parsed `msg_type`, `stock_locate`, `price`, `share_amt`, `stock_sym`, or any other field — with no kernel-driver round-trip, no DMA descriptor setup, no syscall. The host-side tools `bar_read` and `read_parser_regs.py` wrap this interface so any group member with the sudoers permission described in §4 can inspect parser state from a shell.
 
@@ -757,7 +761,13 @@ sudo bar_read 0x200000          # → 0x49544348  ("ITCH" magic)
 sudo bar_read 0x20000C          # → REG_PARSED_MSG_COUNT
 ```
 
-The binary BDF and BAR size are hardcoded for `hft03`'s U55C; portability is a single-line edit.
+The helper defaults to `hft03`'s U55C BDF (`0000:83:00.0`) but honors the `OPENNIC_BDF` environment variable for other hosts. Use `sudo -E` when overriding the BDF so the environment variable survives the sudo invocation:
+
+```bash
+OPENNIC_BDF=0000:af:00.0 sudo -E bar_read 0x200000
+```
+
+The 4-byte read size, default BDF, and per-call bounds-check against the BAR size reported by `fstat` are documented in the script's docstring at `open-nic-shell/script/bar_read.py`.
 
 **`bar_write.py`** — privileged 32-bit word write to BAR2.
 
@@ -765,7 +775,7 @@ The binary BDF and BAR size are hardcoded for `hft03`'s U55C; portability is a s
 sudo bar_write 0x8090 0x00002222    # write GT_LOOPBACK_REG_0 (CMAC IP)
 ```
 
-Added during bring-up; useful for poking CMAC IP registers without rebuilding.
+Same portability semantics as `bar_read.py`: defaults to `hft03`'s BDF, honors `OPENNIC_BDF`, requires `sudo -E` when overriding. Added during bring-up; useful for poking CMAC IP registers without rebuilding.
 
 **`read_parser_regs.py`** — high-level wrapper that calls `bar_read` for every register in the map and decodes each value (ASCII for MAGIC and stock symbol, dotted-quad for IPs, ASCII for buy/sell, etc.).
 
