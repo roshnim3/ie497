@@ -12,6 +12,7 @@ High-frequency trading requires decisions within microseconds of market-data arr
 
 ## Table of Contents
 
+0. [Fresh Clone Checklist](#0-fresh-clone-checklist)
 1. [Project Overview](#1-project-overview)
 2. [Repository Structure](#2-repository-structure)
 3. [Hardware and Software Environment](#3-hardware-and-software-environment)
@@ -27,6 +28,78 @@ High-frequency trading requires decisions within microseconds of market-data arr
 13. [Engineering Notes and Bring-Up Debug Narrative](#13-engineering-notes-and-bring-up-debug-narrative)
 14. [Known Limitations and Future Work](#14-known-limitations-and-future-work)
 15. [References](#15-references)
+
+---
+
+## 0. Fresh Clone Checklist
+
+The exact order of operations to go from `git clone` to a working parser demo. Cross-references point to the section that explains each step in full. Do these in order; do not skip steps.
+
+```bash
+# === ON ANY MACHINE WITH GIT ACCESS ===
+
+# (1) Clone with submodules. ${CLONE_PATH} is wherever you want — no assumption
+#     is made about home directories.
+git clone --recursive \
+    https://gitlab.engr.illinois.edu/ie497_ie597_independent_study_spring_2026/ie497_spring_2026_group_01/group_01_project.git \
+    ${CLONE_PATH}                                                  # see §5
+cd ${CLONE_PATH}
+
+# === ON THE BUILD MACHINE (hft06 by default) ===
+
+# (2) Source Vivado on the build machine. Final bitstream was built with
+#     Vivado 2024.2 — adjust the version below if your host has a different
+#     install under /tools/Xilinx/Vivado/ (see §3.2).
+source /tools/Xilinx/Vivado/2024.2/settings64.sh
+vivado -version                                                   # record this output
+
+# (3) Build the parser bitstream inside tmux. Takes 3–5 hours.        see §8
+tmux new -s build_parser
+cd open-nic-shell/script
+vivado -mode batch -source ./build.tcl -tclargs \
+    -board au55c -tag final \
+    -user_plugin ../plugin/p2p \
+    -impl 1 -post_impl 1 -overwrite 1 -jobs 8 \
+    2>&1 | tee ../build_final.log
+# Ctrl-B D to detach. tmux attach -t build_parser to reconnect.
+
+# === ON THE FPGA HOST (hft03) ===
+
+# (4) Install root-owned wrappers + sudoers rule. One-time per host.   see §5.1, §4
+sudo install -m 0755 -o root -g root open-nic-shell/script/setup_device.sh  /usr/local/bin/setup_open_nic_device
+sudo install -m 0755 -o root -g root open-nic-shell/script/program_fpga.sh  /usr/local/bin/program_open_nic_fpga
+sudo install -m 0755 -o root -g root open-nic-shell/script/bar_read.py      /usr/local/bin/bar_read
+sudo install -m 0755 -o root -g root open-nic-shell/script/bar_write.py     /usr/local/bin/bar_write
+# Sudoers file goes to /etc/sudoers.d/sp26-ie497-dl-grp01 — see §4.1 for contents.
+
+# (5) Program the FPGA.                                              see §9
+export EXTENDED_DEVICE_BDF1=0000:83:00.0
+sudo -E /usr/local/bin/program_open_nic_fpga \
+    open-nic-shell/build/au55c_final/open_nic_shell/open_nic_shell.runs/impl_1/open_nic_shell.bit \
+    au55c
+
+# (6) Load the onic driver. Locate onic.ko once and use that path.    see §9.4
+sudo find / -name onic.ko 2>/dev/null
+sudo insmod <path-from-step-above>
+
+# (7) Configure the network interface + static ARP.                  see §9.5
+sudo ip link set ens2 up
+sudo ip addr add 10.0.0.3/24 dev ens2
+sudo arp -i ens2 -s 10.0.0.99 02:00:00:00:00:99
+
+# (8) Sanity-check the parser is reachable.                          see §9.6
+sudo bar_read 0x200000      # expect: 0x49544348  ("ITCH")
+
+# (9) Run the end-to-end demo.                                       see §10
+python3 open-nic-shell/script/read_parser_regs.py > /tmp/before.txt
+python3 open-nic-shell/script/send_itch.py --src-ip 10.0.0.3 --dst-ip 10.0.0.99 --count 5 --interval 0.2
+python3 open-nic-shell/script/read_parser_regs.py > /tmp/after.txt
+diff /tmp/before.txt /tmp/after.txt
+```
+
+If you are running on a host other than `hft03`, additionally `export OPENNIC_BDF=<your-bdf>` before step (8) so `bar_read` / `bar_write` find the right PCIe device (see §5.2).
+
+The remainder of the report explains why each step looks like this, what failure modes to watch for, and what the expected results are.
 
 ---
 
@@ -156,13 +229,36 @@ The CPU simulation does **not** synthesize on Vivado because the baseline RV32IM
 
 ### 3.2 Tool versions
 
-| Tool | Where used | Version observed | Notes |
+#### Vivado
+
+The Vivado installation used for the final parser bitstream lives at the standard Xilinx lab path on `hft06`. Sourcing the settings script makes `vivado` available on the shell `PATH`:
+
+```bash
+# On hft06, before launching any build:
+source /tools/Xilinx/Vivado/2024.2/settings64.sh
+
+# Verify what is now active:
+which vivado
+vivado -version
+echo "$XILINXD_LICENSE_FILE"
+echo "$LM_LICENSE_FILE"
+```
+
+The final parser bitstream was built with **Vivado 2024.2** on `hft06`. The installation lives at `/tools/Xilinx/Vivado/2024.2/`, and the `vivado` binary used is `/tools/Xilinx/Vivado/2024.2/bin/vivado`. The build TCL is version-agnostic — any UIUC Vivado lab install that supports the `au55c` board file and the 100G CMAC v3.1 IP will produce an equivalent bitstream — but the table below reflects the specific install we exercised.
+
+XRT (Xilinx Runtime) is **not** required for this project's tested flow. The parser is programmed via Vivado's hardware manager invoked from `program_fpga.sh`, and host-side access is through `/sys/bus/pci/.../resource2` and the standard `onic` kernel module — neither path uses XRT.
+
+#### Full tool inventory
+
+| Tool | Where used | Version | Notes |
 |---|---|---|---|
-| Xilinx Vivado | `hft06` (and `hft03` for the secondary build) | 2022.1 or later (any version supporting au55c) | The OpenNIC build TCL is version-agnostic; we did not depend on any specific Vivado feature beyond the standard 100G CMAC v3.1 IP. |
-| Synopsys VCS | EWS | as installed on EWS (2024.x) | invoked through the CPU repo's existing `sim/Makefile` |
-| RISC-V GCC | EWS | `riscv64-unknown-elf-gcc` (whatever EWS provides) | targets `rv32i_zicsr` after the M-extension was deleted; before that, `rv32im` |
-| `gcc` / `make` on the host | `hft03` | system default | for `bar_read.py` / `bar_write.py` (no native compile needed; they are Python) |
-| Python | `hft03`, `hft06` | 3.8+ | `bar_read.py`, `bar_write.py`, `read_parser_regs.py`, `send_itch.py`, `send_raw_bytes.py` all run on Python 3 only |
+| Xilinx Vivado | `hft06` (parser bitstream); `hft03` available as backup | **2024.2** (`/tools/Xilinx/Vivado/2024.2/bin/vivado`) | Source `/tools/Xilinx/Vivado/2024.2/settings64.sh` before running the build. |
+| Xilinx 100G CMAC IP | inside Vivado | v3.1 (`CONFIGURATION_REVISION_REG = 0x00000301` confirmed via BAR read after bring-up) | Licensed; available through the campus Xilinx license server. |
+| Synopsys VCS | EWS workstations | as installed on EWS (2024.x line) | invoked through the CPU repo's existing `sim/Makefile`. No build customization. |
+| RISC-V GCC | EWS workstations | `riscv64-unknown-elf-gcc` from the EWS toolchain (run `riscv64-unknown-elf-gcc --version` to capture) | `--march=rv32i_zicsr --mabi=ilp32` after the M-extension was deleted; `rv32im` on the original baseline branch. |
+| Python | `hft03`, `hft06`, EWS | 3.8 or newer | `bar_read.py`, `bar_write.py`, `read_parser_regs.py`, `send_itch.py`, `send_raw_bytes.py` are pure Python 3, no external packages required. |
+| `setpci`, `lspci`, `tcpdump`, `ethtool`, `ip`, `arp` | `hft03` | system default (Ubuntu) | Used during programming and bring-up. |
+| XRT | _not used_ | — | The OpenNIC flow does not depend on XRT. |
 
 ### 3.3 OpenNIC dependencies
 
@@ -187,7 +283,7 @@ The Xilinx Alveo U55C accelerator on `hft03` is permanently enumerated at:
 | BAR2 resource | `/sys/bus/pci/devices/0000:83:00.0/resource2` (4 MB) |
 | Linux netdev (when driver bound) | `ens2` |
 
-The BDF values are stable across reboots on `hft03` and are referenced directly in `bar_read.py`, `bar_write.py`, and `program_fpga.sh`. If the project is moved to a different host, only the BDF constant inside the two BAR helpers (`BDF = "0000:83:00.0"`) needs updating.
+The BDF values are stable across reboots on `hft03`. They are the **defaults** baked into `bar_read.py` and `bar_write.py`; both helpers honor the `OPENNIC_BDF` environment variable to override the default on any other host (see §5.2). `program_fpga.sh` reads the BDF from the `EXTENDED_DEVICE_BDF1` environment variable that the operator exports before invoking it.
 
 ---
 
@@ -197,32 +293,24 @@ The OpenNIC programming flow and BAR-region access both require root for specifi
 
 ### 4.1 The sudoers entry installed on `hft03`
 
-File: `/etc/sudoers.d/sp26-ie497-dl-grp03`
+File: `/etc/sudoers.d/sp26-ie497-dl-grp01`
 
 ```
-%sp26-ie497-dl-grp03 ALL=(ALL) NOPASSWD: /home/suvids2/open-nic-shell/script/setup_device.sh *
-%sp26-ie497-dl-grp03 ALL=(ALL) NOPASSWD: /home/suvids2/open-nic-shell/script/program_fpga.sh *
-%sp26-ie497-dl-grp03 ALL=(ALL) NOPASSWD: /usr/local/bin/bar_read *
-%sp26-ie497-dl-grp03 ALL=(ALL) NOPASSWD: /usr/local/bin/bar_write *
+%sp26-ie497-dl-grp01 ALL=(ALL) NOPASSWD: /usr/local/bin/setup_open_nic_device *
+%sp26-ie497-dl-grp01 ALL=(ALL) NOPASSWD: /usr/local/bin/program_open_nic_fpga *
+%sp26-ie497-dl-grp01 ALL=(ALL) NOPASSWD: /usr/local/bin/bar_read *
+%sp26-ie497-dl-grp01 ALL=(ALL) NOPASSWD: /usr/local/bin/bar_write *
 ```
+
+**Design note.** Every path in the rule is a system-level absolute path under `/usr/local/bin/`. Nothing points into any user's home directory. The four binaries referenced are root-owned 0755 wrappers installed once per host from the repository (see §5.1). This satisfies the design requirement that no reproducible step depend on a particular user's account name.
 
 ### 4.2 What each grant covers
 
-- **`setup_device.sh *` and `program_fpga.sh *`** — These two scripts internally call `setpci`, `tee /sys/bus/pci/devices/.../remove`, `tee /sys/bus/pci/devices/.../rescan`, and `rmmod` / `insmod` on the onic kernel driver. By granting NOPASSWD on the *scripts*, the host operator avoids granting wildcard NOPASSWD on the underlying system commands (which would create a much broader privilege footprint). The scripts themselves are root-owned with mode 0755, so unprivileged users cannot modify them to escape the intended scope.
+- **`setup_open_nic_device *` and `program_open_nic_fpga *`** — Root-owned 0755 wrappers around the repo's `script/setup_device.sh` and `script/program_fpga.sh`. They internally call `setpci`, `tee /sys/bus/pci/devices/.../remove`, `tee /sys/bus/pci/devices/.../rescan`, and `rmmod` / `insmod` on the `onic` kernel module. Granting NOPASSWD on the *wrappers* (rather than on each underlying system command) keeps the privilege footprint tight. Because the wrappers are root-owned and not writable by unprivileged users, group members cannot edit them to escape the intended scope.
 
-- **`/usr/local/bin/bar_read *` and `/usr/local/bin/bar_write *`** — These are Python helpers (described in §7.5) that mmap-read or mmap-write BAR2 of a specific BDF, with bounds checking. They are root-owned 0755 binaries installed via:
+- **`/usr/local/bin/bar_read *` and `/usr/local/bin/bar_write *`** — Python helpers (described in §7.5) that `mmap`-read or `mmap`-write 32-bit words from BAR2 of a specific PCIe device, with bounds checking against the BAR size reported by `fstat`. The 4-byte access size and the per-call BAR-size verification make them safe to expose at group level. They honor the `OPENNIC_BDF` environment variable (defaulting to `0000:83:00.0` for `hft03`'s U55C) so the same binaries work on any host whose U55C is enumerated at a different bus/device/function.
 
-  ```bash
-  sudo install -m 0755 -o root -g root \
-      open-nic-shell/script/bar_read.py \
-      /usr/local/bin/bar_read
-
-  sudo install -m 0755 -o root -g root \
-      open-nic-shell/script/bar_write.py \
-      /usr/local/bin/bar_write
-  ```
-
-  The scoped wildcard `*` after the path lets group members pass arbitrary register offsets and (for `bar_write`) values, while still preventing them from invoking any other binary. The internal bounds check inside `bar_read.py` / `bar_write.py` enforces that offset + 4 ≤ BAR size and refuses anything beyond.
+The scoped wildcard `*` after each rule lets group members pass arbitrary register offsets and (for `bar_write`) values, while still preventing them from invoking any other binary on the system through sudo.
 
 ### 4.3 Membership requirement
 
@@ -246,9 +334,9 @@ The repository is hosted on UIUC's GitLab. Clone with submodules:
 
 ```bash
 # Choose any clone location — the project does not assume a specific path.
-# All commands below are written relative to the clone root.
+# All repo-level commands below are written relative to the clone root.
 
-git clone --recursive <gitlab-url-or-ssh-spec> ie497
+git clone --recursive https://gitlab.engr.illinois.edu/ie497_ie597_independent_study_spring_2026/ie497_spring_2026_group_01/group_01_project.git ie497
 cd ie497
 
 # If you cloned without --recursive, fetch the submodules now:
@@ -260,20 +348,36 @@ This brings down both subprojects:
 - `open-nic-shell/` — fork of Xilinx OpenNIC with the parser plugin and CMAC-wrapper modifications
 - `riscv-cpu/` — the custom RV32IM out-of-order core with the four custom instructions
 
-The remainder of this document refers to the clone root as `${PROJECT_ROOT}`. Every command shown is relative to it; no absolute paths to anyone's home directory are baked in.
+**Path convention used throughout this document.** All repo-level commands are written relative to the clone root, which we refer to as `${PROJECT_ROOT}`. System-level commands intentionally use system absolute paths (`/usr/local/bin`, `/sys/bus/pci`, `/tools/Xilinx`, `/etc/sudoers.d`) because those locations are fixed by the operating system and the Xilinx tool layout, not by who installed them. **No command in this document depends on a specific user's home directory.** Anywhere a user might have been tempted to embed a `/home/<user>/...` path — sudoers rules, kernel-module paths, build artifacts — the document instead points at a root-owned `/usr/local/bin/` wrapper or a `find` command that discovers the real location at run time.
 
 ### 5.1 Adding the BAR helpers to the system path on `hft03`
 
-Required only once per host, after `git pull`. From the clone root:
+Required only once per host, after the first clone or after a `git pull` that touches any of these files. From the clone root:
 
 ```bash
-sudo install -m 0755 -o root -g root open-nic-shell/script/bar_read.py  /usr/local/bin/bar_read
-sudo install -m 0755 -o root -g root open-nic-shell/script/bar_write.py /usr/local/bin/bar_write
+sudo install -m 0755 -o root -g root open-nic-shell/script/setup_device.sh  /usr/local/bin/setup_open_nic_device
+sudo install -m 0755 -o root -g root open-nic-shell/script/program_fpga.sh  /usr/local/bin/program_open_nic_fpga
+sudo install -m 0755 -o root -g root open-nic-shell/script/bar_read.py      /usr/local/bin/bar_read
+sudo install -m 0755 -o root -g root open-nic-shell/script/bar_write.py     /usr/local/bin/bar_write
 ```
 
-(These commands need root once for installation, but afterwards the scoped sudoers rule in §4 allows the group to invoke the installed binaries without a password.)
+These four `install` commands need root once each, but afterwards the scoped sudoers rule in §4 allows any member of `sp26-ie497-dl-grp01` to invoke the installed binaries without a password. The installed copies are root-owned and detached from any user's home directory.
 
-### 5.2 Host network configuration on `hft03`
+### 5.2 (Optional) Override the PCIe BDF for a different host
+
+`bar_read` and `bar_write` default to BDF `0000:83:00.0` (the U55C on `hft03`). On any other host whose U55C is at a different BDF, export `OPENNIC_BDF` before invoking the helpers:
+
+```bash
+# one-time per shell on a different host:
+export OPENNIC_BDF=0000:af:00.0   # whatever lspci shows for the U55C on that host
+
+# subsequent invocations:
+sudo -E bar_read 0x200000          # the -E preserves the env var across sudo
+```
+
+`read_parser_regs.py` invokes `bar_read` as a subprocess, so the same `OPENNIC_BDF` export reaches it via the inherited environment.
+
+### 5.3 Host network configuration on `hft03`
 
 After the FPGA is programmed (§9), the OpenNIC interface comes up as `ens2`. We use a static unrouted subnet, with a manual ARP entry so the kernel will transmit UDP without ARP resolution depending on the (deliberately absent) network partner:
 
@@ -786,33 +890,52 @@ lsmod | grep onic
 sudo rmmod onic     # use rmmod (not modprobe -r): the .ko lives outside /lib/modules
 ```
 
-### 9.3 Run `program_fpga.sh`
+### 9.3 Run the programming flow
+
+The wrapper installed in §5.1 (`/usr/local/bin/program_open_nic_fpga`) calls the repo's `script/program_fpga.sh` internally. Invoke it through sudo so the scoped NOPASSWD rule (§4.1) takes effect:
 
 ```bash
-cd open-nic-shell/script
+# from anywhere on hft03 — paths to the bitstream are relative to wherever you cd'd to
 export EXTENDED_DEVICE_BDF1=0000:83:00.0
-./program_fpga.sh ../build/au55c_<tag>/open_nic_shell/open_nic_shell.runs/impl_1/open_nic_shell.bit au55c
+sudo -E /usr/local/bin/program_open_nic_fpga \
+    /absolute/or/relative/path/to/open_nic_shell.bit \
+    au55c
 ```
 
-The script:
+`-E` is required so the exported `EXTENDED_DEVICE_BDF1` survives the sudo invocation. The expected bitstream is the file produced by the Vivado build in §8.1:
 
-1. Disables SERR and ERR_FATAL on the bridge (`setpci -s 0000:80:02.0 COMMAND=0000:0100`, `CAP_EXP+8.w=0000:0004`)
-2. Opens the Vivado hardware manager, programs the bitstream
-3. After you press **`c`**, removes the PCIe device, rescans the bridge, re-enables memory space (`setpci -s 0000:83:00.0 COMMAND=0x02`)
+```
+${PROJECT_ROOT}/open-nic-shell/build/au55c_<tag>/open_nic_shell/open_nic_shell.runs/impl_1/open_nic_shell.bit
+```
 
-### 9.4 Load the onic driver
+The wrapped script:
+
+1. Disables `SERR#` and `ERR_FATAL` on the upstream bridge (`setpci -s 0000:80:02.0 COMMAND=0000:0100`, `CAP_EXP+8.w=0000:0004`).
+2. Launches the Vivado hardware manager in interactive mode, prompts you to confirm programming, and waits for the bitstream to load.
+3. After you press **`c`** to confirm completion, removes the PCIe device, rescans the upstream bridge, and re-enables memory space access (`setpci -s 0000:83:00.0 COMMAND=0x02`).
+
+### 9.4 Load the `onic` kernel driver
+
+The `onic` driver is built from a separate Xilinx repository (`open-nic-driver`) and installed into the runtime path during initial lab setup. On `hft03` the resulting `onic.ko` is **not** under `/lib/modules`, so `modprobe` will not find it — `insmod` against the absolute path is required.
 
 ```bash
-# Locate the .ko (it's outside /lib/modules so modprobe won't find it):
-sudo find / -name onic.ko 2>/dev/null | head -1
+# Discover where onic.ko lives on this host:
+sudo find / -name onic.ko 2>/dev/null
 
-# Load it (substitute the path you just found):
-sudo insmod <path-to-onic.ko>
+# Expected (on hft03): a single hit similar to one of:
+#   /opt/onic/onic.ko
+#   /usr/local/lib/onic/onic.ko
+#   /home/<lab-shared-account>/open-nic-driver/onic.ko
 
-# Confirm:
-lsmod | grep onic
-ip -br link | grep ens2
+# Load it using the path you found:
+sudo insmod <path-from-above>
+
+# Verify:
+lsmod | grep onic                     # expect:  onic  135168  0
+ip -br link | grep ens2               # expect:  ens2  UP|DOWN ...
 ```
+
+If `find` returns multiple hits, prefer the one under `/opt/` or `/usr/local/` over any user-home location. Record the verified path on your host and use it consistently across sessions.
 
 ### 9.5 Configure the network interface
 
