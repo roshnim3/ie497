@@ -338,8 +338,8 @@ fetch_trade rd, imm[2:0]   →  rd ← parsed_packet[head].slot[imm]
 | 1 | Stock locate |
 | 2 | Shares (32-bit) |
 | 3 | Price (32-bit) |
-| 4 | **Empty flag** (read-only; returns 1 if FIFO empty) |
-| 5 | **Pop trigger** (read advances `tail_ptr`) |
+| 4 | Empty flag (read-only; returns 1 if FIFO empty) |
+| 5 | Pop trigger (read advances `tail_ptr`) |
 | 6 | Sequence number |
 | 7 | Reserved |
 
@@ -515,6 +515,34 @@ The core is now in the state where it could be dropped into a Vivado project: it
 ## 7. FPGA Side: OpenNIC Packet Parser
 
 This section describes the hardware half of the project — a Verilog packet-parser plugin synthesized into the OpenNIC framework and running on the U55C accelerator card in `hft03`.
+
+### 7.0 Why OpenNIC, and how it fits the project
+
+**The framework.** OpenNIC ([github.com/Xilinx/open-nic](https://github.com/Xilinx/open-nic)) is a Xilinx-maintained open-source FPGA network-interface framework. It packages, in a single shell bitstream, every piece of plumbing that a programmable 100-gigabit NIC needs:
+
+- The Xilinx UltraScale+ Integrated 100G Ethernet Subsystem (CMAC IP) wired to the QSFP transceivers
+- PCIe Gen3/4 host attachment via the QDMA subsystem
+- AXI-Stream packet adapters between the CMAC and the host DMA path
+- Clock generation, reset distribution, and synchronous bring-up sequencing for the two user-logic clock domains (250 MHz and 322 MHz)
+- A BAR2 address map that exposes both the framework's own status registers and any user-added plugin registers to host software through memory-mapped PCIe
+
+Building any one of these blocks from scratch is itself a multi-semester effort — the CMAC IP alone is a licensed Xilinx block with non-trivial bring-up complexity, and the QDMA/PCIe stack involves a dozen interrelated IPs configured through carefully-ordered TCL scripts. OpenNIC's value is the *shell*: it gives us two reserved Box regions (250 MHz at BAR2 `0x100000–0x1FFFFF` and 322 MHz at `0x200000–0x2FFFFF`) into which custom logic drops without having to rebuild the NIC infrastructure underneath.
+
+**Why we chose it.** Our project's research contribution is the ITCH packet parser, not the network plumbing. By layering our custom logic on top of OpenNIC, we could focus engineering effort on what is genuinely novel — the protocol-decode FSM, the AXI-Lite register interface, and the bring-up debug methodology described in §13 — instead of spending the semester reconstructing a 100-gigabit Ethernet datapath we have no intention of changing. The alternative we evaluated, Xilinx's `xup_vitis_network_example`, would have required writing the parser in HLS-targetable C++ rather than SystemVerilog; we preferred SystemVerilog because cycle-accurate control over the AXI-Stream beat structure was load-bearing for the design (and, as it turned out, load-bearing for the bring-up debug as well).
+
+#### Milestones, in chronological order
+
+The OpenNIC half of the project advanced through four discrete strides, each of which unblocked the next:
+
+**1. Getting OpenNIC built and flashed on a U55C at all.** The prior semester's IE421 team attempted FPGA-based packet handling for this same problem space but did not produce a working bitstream that could be programmed onto the U55C and brought up with a host-visible network interface. Our first major stride was establishing the full build-and-program flow end to end: Vivado configured with the correct board files, the CMAC IP license obtained through the campus license server, `program_fpga.sh` and `setup_device.sh` exercised against `hft03`'s PCIe bridge, the `onic` kernel module loaded against the freshly-enumerated device, and a netdev (`ens2`) appearing in `ip link`. This stride alone took multiple weeks and required coordination with course staff on sudoers configuration, license-server access, and PCIe bridge enable bits. **End state: a stock OpenNIC bitstream programmed onto `hft03`'s U55C, the host enumerating the device, and a 100-gigabit Ethernet interface visible to the operating system.**
+
+**2. Integrating the custom parser plugin into Box1.** Once the framework was demonstrably working, we wrote and integrated `plugin/p2p/packetparser_322mhz_simple.sv` — a Tier-3-capable ITCH/MoldUDP64 parser that snoops the CMAC RX AXI-Stream, decodes the Ethernet / IPv4 / UDP / MoldUDP64 / ITCH layered protocol stack in hardware, and exposes the decoded fields as named module outputs. This is the project's actual research contribution: every byte of protocol decoding that would conventionally happen in software is lifted into purpose-built silicon, with a deterministic per-beat schedule and no caching, branching, or speculation involved.
+
+**3. Adding the AXI-Lite register interface.** A parser that decodes to no observable effect is invisible. To make the parsed fields readable from host software, we added the 28-register AXI-Lite block in `plugin/p2p/p2p_322mhz.sv` (later extended to 33 registers as the diagnostic counters in §13.4 were added during bring-up) and wired it into OpenNIC's BAR2 address space at offset `0x200000`. This is the interface between hardware and software: a single 32-bit memory-mapped load from the host returns the most recently parsed `msg_type`, `stock_locate`, `price`, `share_amt`, `stock_sym`, or any other field — with no kernel-driver round-trip, no DMA descriptor setup, no syscall. The host-side tools `bar_read` and `read_parser_regs.py` wrap this interface so any group member with the sudoers permission described in §4 can inspect parser state from a shell.
+
+**4. Flashing the integrated bitstream and verifying end-to-end correctness.** The final stride was producing a working bitstream containing the parser and the AXI-Lite interface together, programming it onto the U55C, configuring the network interface with CMAC PCS internal loopback, and running the end-to-end demo described in §10. In that demo, `send_itch.py` emits real MoldUDP64-wrapped ITCH Add Order packets from the kernel through `ens2`, the CMAC delivers them to the parser via loopback, the parser decodes every protocol layer, and the host reads back every parsed field through BAR2. Verifying that this entire chain produced *exactly* the field values the sender emitted — `msg_type='A'`, `buy_sell='B'`, `stock_sym="AAPL"`, `price=9989684`, `share_amt=1004`, `stock_locate=0x1234`, `ref_num=0x0123ABCD000186A5` — is what closes the loop and what makes the parser a hardware artifact rather than a simulation artifact.
+
+The remainder of this section documents the technical structure that supports those four milestones.
 
 ### 7.1 OpenNIC architecture, abridged
 
