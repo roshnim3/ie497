@@ -226,10 +226,10 @@ File: `/etc/sudoers.d/sp26-ie497-dl-grp03`
 
 ### 4.3 Membership requirement
 
-The user account performing FPGA bring-up must be a member of the Unix group `sp26-ie497-dl-grp03`. Verify with:
+The user account performing FPGA bring-up must be a member of the Unix group `sp26-ie497-dl-grp01`. Verify with:
 
 ```bash
-id | tr ',' '\n' | grep sp26-ie497-dl-grp03
+id | tr ',' '\n' | grep sp26-ie497-dl-grp01
 ```
 
 If the group does not appear, log out and back in (the group may have been added after the current session started) or request membership from the course instructor.
