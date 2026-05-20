@@ -289,7 +289,17 @@ sudo arp -i ens2 -s 10.0.0.99 02:00:00:00:00:99
 
 ## 6. RISC-V CPU Side: Custom Instructions in Simulation
 
-This section describes the simulation-only CPU half of the project. Everything in this section lives under `${PROJECT_ROOT}/riscv-cpu/` and is exercised by running the existing VCS-based test flow on EWS.
+This section describes the CPU half of the project. Everything described here lives under `${PROJECT_ROOT}/riscv-cpu/` and is exercised by running the existing VCS-based test flow on EWS.
+
+### 6.0 What this core is, in plain terms
+
+The RISC-V processor used for this project is **not an off-the-shelf core**. It was hand-built by the project team during a previous semester (IE421, where it received an A grade) as a non-superscalar **out-of-order RV32IM** implementation, and was extended for this thesis with the four custom instructions described in §6.2 and §6.3. Every pipeline stage, every reservation station, and every commit-bus arbiter in the design is original Verilog written by the team.
+
+**What "out-of-order" means.** The processor does not necessarily execute instructions in the program order they appear. As long as data dependencies are honored, the hardware is free to schedule any *ready* instruction onto any available functional unit, then re-order the results back into program order at the commit stage so that programmer-visible state remains consistent. This contrasts with the simpler "in-order" pipelines used in most teaching cores and in many commercial embedded processors, where instruction *N+1* cannot begin executing until instruction *N* finishes. The benefit of out-of-order issue is that long-latency operations — memory loads that miss in cache, multi-cycle multiplies, or in our case the multi-cycle `fetch_trade` and `pkt_s` custom instructions — can sit in the reservation stations waiting for their operands or for the functional unit to drain, without stalling the entire processor. Independent instructions slide past them and execute in the shadow.
+
+This matters for HFT-style workloads because the decision predicate after a `fetch_trade` (a branch on price/shares) and the frame-build sequence after the decision (a fan-out of `pkt_w` writes) contain a mix of latency-tolerant and latency-critical operations. An OoO pipeline keeps the critical-path work moving while the tolerant work amortizes itself in parallel. The waterfall in §6.5 makes this concrete: a 16-cycle TX drain runs in parallel with the firmware setting up the next decision rather than blocking it.
+
+The core's specific structures and dimensions are:
 
 ### 6.1 Baseline core
 
@@ -424,6 +434,46 @@ Translated to bandwidth:
 | drops at parser interval = 512 | 0 |
 
 Saturation occurs at parser interval = 16 (215 parser writes / 100 commits). At parser interval ≥ 256, zero drops are observed.
+
+### 6.10 Making the core FPGA-synthesizable
+
+All measurements in §6.4–§6.9 were taken on the original RV32IM core in Synopsys VCS on EWS. That core cannot be synthesized in Vivado as-is: the multiplier and divider units depend on Synopsys **DesignWare** IP (`DW02_mult` and `DW_div_seq`), which is provided only as encrypted, ASIC-process-specific blocks. DesignWare is not part of any FPGA tool flow.
+
+As a step toward placing the core onto silicon, we created an alternate branch (`roshnim/cpu-fpga`) that **strips the M-extension entirely** — removing the multiplier, divider, their reservation stations, and the corresponding decode and dispatch entries. The resulting core is plain RV32I, has no DesignWare references, and is therefore eligible for Vivado synthesis:
+
+```bash
+$ grep DW_ riscv-cpu/sim/vcs/compile.log
+$       # ← zero DesignWare references in VCS elaboration
+```
+
+The strip removed approximately 735 net lines of code across 12 files:
+
+- `pkg/types.sv` (FU and RS type definitions cleaned of `FU_MUL` / `FU_DIV`)
+- Four files under `hdl/core/` (decode, rename, dispatch, top-level CPU)
+- `hdl/execution/prf.sv` (physical register file ports)
+- `bin/get_options.py` and `options.json` (toolchain target changed from `rv32im` to `rv32i_zicsr`)
+- Deleted: `hdl/execution/{mul,div,mul_rs,div_rs}.sv`
+
+The CDB arbiter priority chain collapsed from `DIV > mul_buf > MUL > trade_buf > TRADE > pkt_tx_buf > PKT_TX` to simply `trade_buf > TRADE > pkt_tx_buf > PKT_TX`. The shared `cdb_mul_div` signal name was preserved to minimize diff noise; it now carries only `fetch_trade` and `pkt_tx` writebacks.
+
+**All custom instructions (`fetch_trade`, `pkt_w`, `pkt_s`, `pkt_st`) were preserved unchanged.** The M-extension was load-bearing for exactly one benchmark (`itch_*_mixed.c`); the rest of the regression set is RV32I-clean.
+
+We re-ran the full benchmark suite against the stripped branch and verified every single measurement is identical to the unstripped baseline, to the cycle:
+
+| Benchmark | Cycles, stripped branch | Cycles, baseline | Match |
+|---|---|---|---|
+| `itch_software` | 234 | 234 | ✓ |
+| `itch_mmio` | 105 | 105 | ✓ |
+| `itch_custom` | 59 (IPC 0.237288) | 59 (IPC 0.237288) | ✓ |
+| `itch_stream` (latency.csv) | byte-identical | byte-identical | ✓ |
+| `itch_send_packet` | 64-byte capture clean | clean | ✓ |
+| `itch_send_overlap` | writes=128, emits=128, overlap=16 | identical | ✓ |
+| `itch_tick_to_trade` | accepted=50, p50=79 | identical | ✓ |
+| `itch_tick_to_trade_sweep` | drain scales linearly | identical | ✓ |
+| `itch_two_protocol` | ARP=1, OUCH=49, UNKNOWN=0 | identical | ✓ |
+| `itch_max_throughput` | 29.14 cycles/packet | identical | ✓ |
+
+The core is now in the state where it could be dropped into a Vivado project: it has no proprietary IP dependencies, the ISA target is the synthesizable subset, and the custom instructions are intact. Producing an actual bitstream containing the stripped core requires the additional integration plumbing described in §14.3 (top-level wrapper around the core + memories, BRAM mapping for instruction and data memory, clock generation, AXI-Lite slave wiring into the OpenNIC Box0 region) — that integration is the natural next milestone but was not completed within the project deadline.
 
 ---
 
@@ -1026,9 +1076,11 @@ The FPGA parser has only been exercised under PCS internal loopback. We have not
 
 The simple parser handles up to 2 ITCH messages per MoldUDP64 packet (Tier 3). Production NASDAQ feeds can pack more. Extending to N-message packets requires generalizing the cross-beat completion FSM in `packetparser_322mhz_simple.sv`.
 
-### 14.3 CPU runs only in simulation
+### 14.3 CPU on FPGA — synthesizability achieved, integration deferred
 
-The custom-instruction RISC-V core has been exercised exclusively in cycle-accurate VCS simulation on EWS. The baseline core uses Synopsys DesignWare IP (`DW02_mult`, `DW_div_seq`), which is ASIC-only and unsynthesizable on Vivado. Porting to FPGA requires either dropping the M-extension (multiply/divide) or replacing the DesignWare IP with Xilinx-native multiplier/divider primitives — neither is technically difficult, just out of scope for this semester.
+All cycle-accurate measurements in §6 were taken in VCS simulation on EWS. The original RV32IM core could not be synthesized in Vivado because of its Synopsys DesignWare dependency. We addressed the synthesizability blocker directly: as described in §6.10, the `roshnim/cpu-fpga` branch strips the M-extension, removes all DesignWare references, and verifies that the full benchmark regression set still passes with cycle-for-cycle identical results to the unstripped baseline. VCS elaboration of that branch produces a DesignWare-free compile log, and the toolchain target is set to `rv32i_zicsr`.
+
+What remains for an actual FPGA bitstream containing the stripped core is **integration work, not core work**: writing a top-level synthesizable wrapper around the core, mapping the instruction and data memories to Xilinx BRAM primitives (the project's `xpm_memory_sdpram` instances already in use for `fetch_trade` and `pkt_tx` are FPGA-friendly), generating a CPU clock from a Vivado MMCM, and wiring the core's AXI-Lite interface into OpenNIC's Box0 region so the host can probe the core via PCIe BAR2. None of these steps requires further HDL modification of the core. Producing the integrated bitstream was not completed within the project's two-day final push but the prerequisite — getting the core into a synthesizable state without losing any custom-instruction functionality — is done.
 
 ### 14.4 Closed-system integration
 
