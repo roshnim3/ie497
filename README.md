@@ -293,7 +293,7 @@ This section describes the CPU half of the project. Everything described here li
 
 ### 6.0 What this core is, in plain terms
 
-The RISC-V processor used for this project is **not an off-the-shelf core**. It was hand-built by the project team during a previous semester (IE421, where it received an A grade) as a non-superscalar **out-of-order RV32IM** implementation, and was extended for this thesis with the four custom instructions described in §6.2 and §6.3. Every pipeline stage, every reservation station, and every commit-bus arbiter in the design is original Verilog written by the team.
+The RISC-V processor used for this project is not an off-the-shelf core. It is an out-of-order RV32IM CPU built by us last semester. This semester our goal was to extended it with the four custom instructions described in §6.2 and §6.3. Every pipeline stage, every reservation station, and every commit-bus arbiter in the design is original Verilog written by the team.
 
 **What "out-of-order" means.** The processor does not necessarily execute instructions in the program order they appear. As long as data dependencies are honored, the hardware is free to schedule any *ready* instruction onto any available functional unit, then re-order the results back into program order at the commit stage so that programmer-visible state remains consistent. This contrasts with the simpler "in-order" pipelines used in most teaching cores and in many commercial embedded processors, where instruction *N+1* cannot begin executing until instruction *N* finishes. The benefit of out-of-order issue is that long-latency operations — memory loads that miss in cache, multi-cycle multiplies, or in our case the multi-cycle `fetch_trade` and `pkt_s` custom instructions — can sit in the reservation stations waiting for their operands or for the functional unit to drain, without stalling the entire processor. Independent instructions slide past them and execute in the shadow.
 
@@ -311,6 +311,16 @@ The core's specific structures and dimensions are:
 - Inherited from the team's IE421 final project (graded A); modified to add the custom instructions described below.
 
 ### 6.2 Custom-1: `fetch_trade` (RX side)
+
+#### What `fetch_trade` does and why it exists
+
+**What it does.** A single RISC-V instruction that reads one field (price, shares, message type, etc.) of a parsed market-data record directly from a small on-chip buffer and returns it in a general-purpose register. The entire round trip — instruction dispatch, BRAM read, writeback to the register file — completes in two cycles.
+
+**Why we included it.** In a conventional HFT software stack, reading a parsed market field requires a memory-mapped load against a network accelerator's PCIe BAR region. That load traverses the L1 cache, then misses out to L2, then to the IOMMU and the PCIe root complex, and finally lands at the accelerator's register file. Even with the cache warm and the load cracked into the fewest possible micro-ops, this typically costs 50–150 cycles on  x86 processors. We wanted to quantify how much could be saved by lifting this access out of the load-store unit entirely and making it a dedicated instruction with its own functional unit.
+
+**Application.** A trading strategy reacting to NASDAQ ITCH Add Order messages issues `fetch_trade rd, 0` to retrieve the message type byte, branches on whether it is `'A'`, then `fetch_trade rd, 3` for the price, branches on the threshold, then `fetch_trade rd, 2` for the shares. Each of these reads is one instruction — versus the multiple-cycle memory-mapped load it replaces. The three-path comparison in §6.4 measures this directly: the same decision predicate takes 59 cycles via `fetch_trade` against 105 cycles via the equivalent memory-mapped load, a 1.78× single-shot speedup.
+
+#### Encoding, semantics, and hardware
 
 **Encoding.** I-type, opcode `0x0B` (RV custom-1 space). The 3-bit immediate selects a *slot* of the current head packet in the parser's RX FIFO. There is no source operand.
 
@@ -339,7 +349,7 @@ fetch_trade rd, imm[2:0]   →  rd ← parsed_packet[head].slot[imm]
 
 ### 6.3 Custom-2: `pkt_w` / `pkt_s` / `pkt_st` (TX side)
 
-**Encoding.** All three share opcode `0x2B` (RV custom-2 space), discriminated by `funct3`. Encodings are defined in `riscv-cpu/pkg/types.sv`.
+The three custom-2 instructions together form the **transmit primitive** — the ISA-level mechanism by which firmware composes an outbound Ethernet frame, releases it for emission, and queries hardware completion state. They share opcode `0x2B` (RV custom-2 space), discriminated by `funct3`, with encodings defined in `riscv-cpu/pkg/types.sv`.
 
 | Mnemonic | Source | Destination | Semantics |
 |---|---|---|---|
@@ -347,18 +357,43 @@ fetch_trade rd, imm[2:0]   →  rd ← parsed_packet[head].slot[imm]
 | `pkt_s rs1` | `rs1` | none | Commits the current staging slot for emission; `rs1` carries the byte length to send (1–64). Advances `staging_ptr`. |
 | `pkt_st rd, imm[2:0]` | none | `rd` | Reads one of four status fields (empty / full / busy / pending-count) from the TX subsystem and returns it in `rd`. |
 
-**Hardware.** Backed by a single BRAM holding 8 staging slots × 16 words × 32 bits = 512 bytes. Port A is the CPU write side; Port B feeds an FSM that drains a slot out to an AXI-Stream master interface (`m_axis_pkt_tx_*`) at one 32-bit beat per cycle. The producer (CPU) and consumer (FSM) operate on different slots concurrently, which lets the firmware stage packet *N+1* while hardware is still emitting packet *N*. This decoupling is the architectural advantage of the multi-buffer design over a single-buffer alternative.
+**Shared hardware.** All three instructions operate on a single BRAM holding 8 staging slots × 16 words × 32 bits = 512 bytes. Port A is the CPU write side; Port B feeds an FSM that drains a slot out to an AXI-Stream master interface (`m_axis_pkt_tx_*`) at one 32-bit beat per cycle. The producer (CPU) and consumer (FSM) operate on different slots concurrently, which lets the firmware stage packet *N+1* while hardware is still emitting packet *N*. This decoupling is the architectural advantage of the multi-buffer design over a single-buffer alternative.
 
-**Status fields** (read via `pkt_st`):
+#### 6.3.1 `pkt_w` — write packet bytes
+
+**What it does.** Writes 4 bytes of register data into a specific 32-bit word position of the current transmit staging buffer, in one instruction. The 4-bit immediate selects which word (0–15) within the 64-byte staging slot to overwrite. There is no destination register.
+
+**Why we included it.** Constructing an Ethernet frame to transmit is fundamentally a byte-streaming operation — destination MAC, source MAC, ethertype, IPv4 header, UDP header, payload. In conventional software, this work is done by the kernel's networking stack, which incurs system-call overhead per send, copies the payload from user to kernel space, allocates an `sk_buff`, sets up DMA descriptors, and writes a doorbell register to the NIC. We wanted frame composition to happen at ISA level — one instruction per 32-bit word, directly into hardware-attached BRAM, no kernel involvement, no copies.
+
+**Application.** A 64-byte order frame (14 bytes Ethernet + 20 bytes IPv4 + 8 bytes UDP + 22 bytes OUCH order body) is built with exactly 16 `pkt_w` instructions, one per word. The two-protocol demonstration in §6.7 uses the *same* `pkt_w` calls to construct both an ARP request and an OUCH order from a single firmware program — concrete proof that the primitive carries no protocol assumptions.
+
+#### 6.3.2 `pkt_s` — trigger send
+
+**What it does.** Commits the current staging buffer to the transmit queue and tells the hardware FSM to drain the first `rs1` bytes out to the AXI-Stream master interface as an Ethernet frame. The instruction advances `staging_ptr` to the next slot of the eight-slot ring, so the next `pkt_w` writes into a fresh buffer while the FSM independently emits the just-committed one.
+
+**Why we included it.** Triggering a packet send in a conventional software stack means writing a doorbell register on the NIC — itself a memory-mapped store through the same load-store unit and PCIe traversal we already identified as the bottleneck on the RX side. We wanted the send trigger to be a first-class ISA primitive rather than a memory access, both for latency and for clean separation between "compose the frame" and "release the frame."
+
+**Application.** After a strategy has built an OUCH order frame with 16 `pkt_w` instructions, `pkt_s 64` releases it for emission. The eight-buffer architecture lets firmware fire orders back-to-back at the rate of the TX drain (16 cycles per 64-byte frame). The phase-2 multi-buffer overlap benchmark in `itch_send_overlap.c` (§12.1) verifies this: 128 CPU-side writes and 128 hardware-side beats with a measured 16 cycles of overlapping Port-A-write / Port-B-emit activity per packet — the producer and consumer are demonstrably running in parallel.
+
+#### 6.3.3 `pkt_st` — query TX status
+
+**What it does.** Reads one of four hardware status fields and returns the value in `rd`. The 3-bit immediate selects which field. The instruction has no source register, completes in two cycles, and has no side effect on the TX subsystem.
 
 | imm | Field |
 |---|---|
 | 0 | `tx_empty` — staging FIFO empty AND FSM IDLE (all sends drained) |
 | 1 | `tx_full` — next `pkt_s` would stall the RS |
-| 2 | `tx_busy` — FSM is in SEND state |
+| 2 | `tx_busy` — FSM currently in SEND state |
 | 3 | `tx_pending` — count of staged-but-not-drained packets (0–8) |
 
-These let firmware do back-pressure-aware sending and end-of-batch synchronization without spinning on `pkt_s` itself.
+**Why we included it.** Once the TX subsystem has eight buffers operating asynchronously to the CPU, the firmware needs visibility into hardware state — has the last buffer drained? Is the queue full? — without resorting to fixed delays or to memory-mapped polls. `pkt_st` makes this visibility an ISA-level operation: one instruction, two cycles, hardware state delivered into a register and ready to be branched on.
+
+**Application.** `pkt_st` enables three concrete firmware patterns:
+
+- **End-of-batch synchronization.** Spin on `pkt_st rd, 0` (`tx_empty`) to wait until every packet has finished emitting before stopping a benchmark timer or reporting completion. Without this, the firmware-visible `pkt_s` returns long before the hardware FSM has finished draining, and end-of-batch timing measurements are off by an entire drain window.
+- **Back-pressure-aware sending.** Spin on `pkt_st rd, 1` (`tx_full`) before issuing `pkt_s` to avoid a reservation-station stall during burst transmits. This lets the firmware do useful work during back-pressure rather than blocking.
+- **Adaptive priority drop.** Read `pkt_st rd, 3` (`tx_pending`) and drop low-priority orders when the queue depth exceeds a threshold — the kind of pattern a production trading strategy uses to degrade gracefully under bursts of incoming market data.
+
 
 ### 6.4 Three-path comparison benchmark
 
