@@ -24,10 +24,9 @@ High-frequency trading requires decisions within microseconds of market-data arr
 9. [Programming the FPGA and Bringing Up the Interface](#9-programming-the-fpga-and-bringing-up-the-interface)
 10. [Reproducing the End-to-End Parser Demo](#10-reproducing-the-end-to-end-parser-demo)
 11. [Reproducing the CPU Benchmark Suite](#11-reproducing-the-cpu-benchmark-suite)
-12. [Canonical Results](#12-canonical-results)
-13. [Engineering Notes and Bring-Up Debug Narrative](#13-engineering-notes-and-bring-up-debug-narrative)
-14. [Known Limitations and Future Work](#14-known-limitations-and-future-work)
-15. [References](#15-references)
+12. [Engineering Notes and Bring-Up Debug Narrative](#12-engineering-notes-and-bring-up-debug-narrative)
+13. [Known Limitations and Future Work](#13-known-limitations-and-future-work)
+14. [References](#14-references)
 
 ---
 
@@ -1101,72 +1100,11 @@ The output `latency.csv` is byte-identical to the saved baseline at `testcode/si
 
 ---
 
-## 12. Canonical Results
-
-This section is the single source of truth that the abstract and the writeup body cite. If a number appears anywhere else in this report and disagrees with this table, this table wins.
-
-### 12.1 RISC-V CPU side (VCS, EWS)
-
-| Benchmark | Metric | Value |
-|---|---|---|
-| `itch_software` | cycles | 234 |
-| `itch_mmio` | cycles | 105 |
-| `itch_custom` | cycles | **59** |
-| `itch_custom` | IPC | 0.237288 |
-| `fetch_trade` vs MMIO (single-shot) | speedup | **1.78×** |
-| `fetch_trade` vs MMIO (steady-state, 1000-iter) | speedup | 1.12× |
-| `itch_stream` (parser interval = 512) | p50 RX latency | 31 cycles |
-| `itch_stream` (parser interval = 512) | p99 RX latency | 36 cycles |
-| `itch_stream` (parser interval = 512) | drops | 0 |
-| `itch_tick_to_trade` | accepted out of 100 | 50 |
-| `itch_tick_to_trade` | steady-state p50 | 79 cycles |
-| Full tick-to-trade (parser commit → tlast) | steady-state | **94 cycles** |
-| Wall-clock @ 322 MHz | derived | ≈ 290 ns |
-| `itch_send_overlap` (Phase 2 multi-buffer) | overlap cycles | 16 |
-| `itch_max_throughput` | cycles per 64 B packet | 29.14 |
-| `itch_max_throughput` | TX bandwidth @ 322 MHz | **5.66 Gbps** |
-| `itch_max_throughput` | TX bandwidth @ 200 MHz | 3.51 Gbps |
-| TX theoretical drain ceiling @ 322 MHz | derived | 10.30 Gbps |
-| `itch_two_protocol` | ARP frames | 1 |
-| `itch_two_protocol` | OUCH frames | 49 |
-| `itch_two_protocol` | unknown frames | 0 |
-
-### 12.2 FPGA parser side (U55C silicon, `hft03`)
-
-| Quantity | Value |
-|---|---|
-| Build target | Xilinx Alveo U55C, OpenNIC framework |
-| Bitstream WNS | + 7.386 ns |
-| Bitstream WHS | + 0.025 ns |
-| CMAC clock | 322 MHz |
-| Loopback mode used for bring-up | PCS internal (`gt_loopback_in = 3'b001`) |
-| AXI-Lite register block | 28 registers + 5 diagnostic = 33 total, BAR2 `0x200000–0x2000FF` |
-| `REG_MAGIC` value | `0x49544348` ("ITCH") |
-| End-to-end demo (5 × ITCH Add Order) | every field decoded exactly matches sender |
-
-### 12.3 Verified field decode (from the §10 demo)
-
-| Sender wrote | Parser decoded |
-|---|---|
-| `msg_type = 'A'` (0x41) | `REG_LAST_MSG_TYPE = 0x41` ✓ |
-| `buy_sell = 'B'` (0x42) | `REG_LAST_BUY_SELL = 0x42` ✓ |
-| src IP `10.0.0.3` | `REG_LAST_SRC_IP = 0x0A000003` ✓ |
-| dst IP `10.0.0.99` | `REG_LAST_DST_IP = 0x0A000063` ✓ |
-| dst port `9000` | `REG_LAST_PORTS` low 16 = `0x2328` ✓ |
-| stock_locate `0x1234` | `REG_LAST_STOCK_LOCATE = 0x00001234` ✓ |
-| ref_num `0x0123ABCD000186A5` | `REG_LAST_REF_NUM_HIGH/LOW = 0x0123ABCD / 0x000186A5` ✓ |
-| shares `1004` | `REG_LAST_SHARE_AMT = 0x000003EC` ✓ |
-| stock_sym `"AAPL    "` | `REG_LAST_STOCK_SYM_HIGH/LOW = 0x4141504C / 0x20202020` ("AAPL"+spaces) ✓ |
-| price `9989684` | `REG_LAST_PRICE = 0x00986E34` ✓ |
-| sequence `5` | `REG_LAST_SEQ_LOW = 0x00000005` ✓ |
-
----
-
-## 13. Engineering Notes and Bring-Up Debug Narrative
+## 12. Engineering Notes and Bring-Up Debug Narrative
 
 This section captures the non-obvious engineering decisions and the debug narrative behind the FPGA bring-up. Documenting these is part of the deliverable both because they were the hardest single-issue bugs to track down and because the diagnostic methodology used to find them is reusable.
 
-### 13.1 Why PCS loopback (not PMA)
+### 12.1 Why PCS loopback (not PMA)
 
 The Xilinx UltraScale+ GT has five loopback modes selectable via the 3-bit `gt_loopback_in` signal:
 
@@ -1190,7 +1128,7 @@ assign gt_loopback_in = {4{3'b001}};
 
 The wrapper drives this signal directly to the four GT lanes of the CMAC. The CMAC IP's internal AXI-Lite `GT_LOOPBACK_REG_0` register at IP offset `0x90` is not connected to this signal in the OpenNIC integration (verified by inspection), so writing it via `bar_write 0x8090 0x00002222` had no effect during bring-up.
 
-### 13.2 The pm_tick fix
+### 12.2 The pm_tick fix
 
 The CMAC IP's stat counter snapshot is gated by `pm_tick`, which in stock OpenNIC is hardwired to `1'b0`. With `pm_tick` never asserting, all stat counters readable via AXI-Lite return their power-on values regardless of how many packets actually passed through.
 
@@ -1204,7 +1142,7 @@ assign pm_tick = &pm_tick_div;     // pulses once every 2^16 cmac_clk cycles ≈
 
 This pulses `pm_tick` well below the IP's required sub-millisecond cadence and above its minimum 4-cycle pulse spacing.
 
-### 13.3 The byte-ordering bug
+### 12.3 The byte-ordering bug
 
 **The symptom.** After PCS loopback was working and `REG_PACKET_COUNT` was rising in lock-step with `send_itch.py` invocations, `REG_PARSED_MSG_COUNT` remained stubbornly at zero. The diagnostic counters showed:
 
@@ -1240,7 +1178,7 @@ Every read inside the parser then uses `tdata_be` in place of `s_axis_cmac_rx_td
 
 After this fix, the §10 end-to-end demo produces the correct output for every field on the first run.
 
-### 13.4 Diagnostic counters as a methodology
+### 12.4 Diagnostic counters as a methodology
 
 The byte-ordering bug would have been substantially harder to find without the seven diagnostic registers added during bring-up. The reusable principle: when a downstream counter (`REG_PARSED_MSG_COUNT`) refuses to move and the upstream counter (`REG_PACKET_COUNT`) is moving correctly, add intermediate counters that progressively localize where in the FSM the signal disappears. Specifically:
 
@@ -1252,7 +1190,7 @@ The byte-ordering bug would have been substantially harder to find without the s
 
 Combined, these counters answered "did the FSM enter beat 1?" (yes, from `BEAT1_COUNT` rising) and "what byte is at the parser's read position?" (`0x00`, from `LAST_MSG_TYPE_SEEN`). Those two facts together identified byte-ordering as the cause without requiring an internal logic analyzer (ILA) or a rebuild.
 
-### 13.5 Why the parser sees CMAC RX directly (not via the adapter)
+### 12.5 Why the parser sees CMAC RX directly (not via the adapter)
 
 The packet adapter in OpenNIC's C2H path can be configured to prepend a per-packet metadata header (16–22 bytes) before handing packets up to QDMA. If the parser tapped this post-adapter path, every parsed offset would be shifted by the metadata length and would need accounting.
 
@@ -1260,33 +1198,33 @@ The parser instead taps `s_axis_cmac_rx_*` *before* the adapter, so it sees raw 
 
 ---
 
-## 14. Known Limitations and Future Work
+## 13. Known Limitations and Future Work
 
-### 14.1 Loopback-only end-to-end testing
+### 13.1 Loopback-only end-to-end testing
 
 The FPGA parser has only been exercised under PCS internal loopback. We have not connected the U55C to an external 100 Gigabit Ethernet source. The PCS-loopback path exercises the full CMAC RX datapath, AXI-Stream presentation, and parser FSM exactly as a real link partner would, but cannot validate link-layer behaviors that depend on remote-end alignment (auto-negotiation, FEC convergence under bit errors, etc.).
 
-### 14.2 Tier-3 multi-message coverage
+### 13.2 Tier-3 multi-message coverage
 
 The simple parser handles up to 2 ITCH messages per MoldUDP64 packet (Tier 3). Production NASDAQ feeds can pack more. Extending to N-message packets requires generalizing the cross-beat completion FSM in `packetparser_322mhz_simple.sv`.
 
-### 14.3 CPU on FPGA — synthesizability achieved, integration deferred
+### 13.3 CPU on FPGA — synthesizability achieved, integration deferred
 
 All cycle-accurate measurements in §6 were taken in VCS simulation on EWS. The original RV32IM core could not be synthesized in Vivado because of its Synopsys DesignWare dependency. We addressed the synthesizability blocker directly: as described in §6.10, the `roshnim/cpu-fpga` branch strips the M-extension, removes all DesignWare references, and verifies that the full benchmark regression set still passes with cycle-for-cycle identical results to the unstripped baseline. VCS elaboration of that branch produces a DesignWare-free compile log, and the toolchain target is set to `rv32i_zicsr`.
 
 What remains for an actual FPGA bitstream containing the stripped core is **integration work, not core work**: writing a top-level synthesizable wrapper around the core, mapping the instruction and data memories to Xilinx BRAM primitives (the project's `xpm_memory_sdpram` instances already in use for `fetch_trade` and `pkt_tx` are FPGA-friendly), generating a CPU clock from a Vivado MMCM, and wiring the core's AXI-Lite interface into OpenNIC's Box0 region so the host can probe the core via PCIe BAR2. None of these steps requires further HDL modification of the core. Producing the integrated bitstream was not completed within the project's two-day final push but the prerequisite — getting the core into a synthesizable state without losing any custom-instruction functionality — is done.
 
-### 14.4 Closed-system integration
+### 13.4 Closed-system integration
 
 The two halves of the project — parser and CPU — share a logical model (the parser produces what the CPU reads via `fetch_trade`) but are not physically wired together. A fully integrated demonstration would place a stripped-down RV32I core directly into OpenNIC's Box0 region, wire the parser's output stream to the CPU's `fetch_trade` BRAM, and run the full closed loop on a single FPGA. The stub plugin scaffolding for Box0 is in place (`plugin/cpu/cpu_stub.sv`); it currently returns a static "RISC" magic value via BAR2 and is a placeholder for the real core.
 
-### 14.5 No real-exchange feed
+### 13.5 No real-exchange feed
 
 We exercised the parser against synthetic MoldUDP64 packets emitted by `send_itch.py`, not against a real exchange feed. The synthetic packets follow the NASDAQ ITCH spec layout exactly, but a real-world deployment would need additional handling for retransmission protocols (MoldUDP64 gap-fill, etc.) that are out of scope here.
 
 ---
 
-## 15. References
+## 14. References
 
 1. **NASDAQ TotalView-ITCH 5.0 Specification.** Defines the binary message layout for `0x41` Add Order, `0x69` Add Order with MPID, `0x68` Stock Trading Action, and other ITCH message types. Used as the authoritative source for parser field offsets.
 
