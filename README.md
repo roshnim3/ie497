@@ -3,6 +3,36 @@
 **IE497, Spring 2026 — Independent Project Report**
 
 ---
+## Group Members
+
+**Roshni Mathew**, Team Leader
+
+I am a senior in Computer Engineering with an interest in FPGAs, neural engineering, and business. My experience includes research in the Machine Learning and Neuroscience space, internships in consulting at McKinsey & Company, system validation at Amazon, and embedded hardware validation at Rivian. I graduated May 2026 with a Bachelor's degree and will be going fulltime at McKinsey & Company as a Business Analyst.  
+
+[LinkedIn](https://www.linkedin.com/in/roshnimathew04/)
+
+[Portfolio](https://roshnim3.github.io)
+
+[School Email](roshnim3@illinois.edu)
+
+[Personal Email](roshnimathew04@gmail.com)
+
+<img src="Documentation/member_headshots/suvid_headshot.jpg" alt="Suvid Singh Headshot" width="190"/>
+
+**Suvid Singh**, Team Member
+
+I am a senior in Computer Engineering. My interests include FPGAs, computer architecture, computer networking, and AI. I have experience with FPGAs, operating systems, and networking. I have work experience as a Course Assistant for ECE 385 and an internship at Qualcomm. I graduated in May 2026 with a bachelor’s degree and will be a Hardware RTL Engineer at Chicago UpDown, a startup out of UChicago that is creating an accelerator for massive memory parallelism. 
+
+[LinkedIn](https://www.linkedin.com/in/suvid-singh/)
+
+[Github](https://github.com/suvi2005)
+
+[School Email](suvids2@illinois.edu)
+
+[Personal Email](suvidsingh28@gmail.com)
+
+***
+
 
 ## Abstract
 
