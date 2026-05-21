@@ -556,7 +556,7 @@ The RISC-V processor used for this project is not an off-the-shelf core. It is a
 
 **What "out-of-order" means.** The processor does not necessarily execute instructions in the program order they appear. As long as data dependencies are honored, the hardware is free to schedule any *ready* instruction onto any available functional unit, then re-order the results back into program order at the commit stage so that programmer-visible state remains consistent. This contrasts with the simpler "in-order" pipelines used in most teaching cores and in many commercial embedded processors, where instruction *N+1* cannot begin executing until instruction *N* finishes. The benefit of out-of-order issue is that long-latency operations — memory loads that miss in cache, multi-cycle multiplies, or in our case the multi-cycle `fetch_trade` and `pkt_s` custom instructions — can sit in the reservation stations waiting for their operands or for the functional unit to drain, without stalling the entire processor. Independent instructions slide past them and execute in the shadow.
 
-This matters for HFT-style workloads because the decision predicate after a `fetch_trade` (a branch on price/shares) and the frame-build sequence after the decision (a fan-out of `pkt_w` writes) contain a mix of latency-tolerant and latency-critical operations. An OoO pipeline keeps the critical-path work moving while the tolerant work amortizes itself in parallel. The waterfall in §6.5 makes this concrete: a 16-cycle TX drain runs in parallel with the firmware setting up the next decision rather than blocking it.
+This matters for HFT-style workloads because the decision predicate after a `fetch_trade` (a branch on price/shares) and the frame-build sequence after the decision (a fan-out of `pkt_w` writes) contain a mix of latency-tolerant and latency-critical operations. An OoO pipeline keeps the critical-path work moving while the tolerant work amortizes itself in parallel. The pipeline in §6.5 makes this concrete: a 16-cycle TX drain runs in parallel with the firmware setting up the next decision rather than blocking it.
 
 The core's specific structures and dimensions are:
 
@@ -666,7 +666,7 @@ The most direct measurement of the custom ISA value is the single-shot, three-im
 
 The `fetch_trade` path is **1.78× faster than MMIO and 4.0× faster than software parsing** on a single decision. Source: `riscv-cpu/testcode/sim_b/itch_{software,mmio,custom}.c`.
 
-### 6.5 Tick-to-trade waterfall
+### 6.5 Tick-to-trade pipeline
 
 `riscv-cpu/testcode/sim_b/itch_tick_to_trade.c` exercises the entire pipeline end-to-end inside the simulator:
 
@@ -706,6 +706,11 @@ This is the concrete proof that the TX primitive is protocol-agnostic — the ha
 ### 6.8 Maximum throughput benchmark
 
 `itch_max_throughput.c` uses `pkt_st` to drive the queue to saturation: it polls `pkt_st(tx_full)` to keep the staging FIFO full and `pkt_st(tx_empty)` for end-of-batch synchronization. Result: **29.14 cycles per 64-byte packet** sustained over 100 packets, against the theoretical drain limit of 16 cycles/packet. The 13.14-cycle gap is FU-bound — primarily the 16 sequential `pkt_w` instructions through a depth-4 RS, plus the misprediction cost of the `pkt_st`-polled inner loop.
+
+The calculation for measured versus theoretical:
+$$
+\text{bandwidth} = \frac{64 \cdot 8 \cdot 322 \times 10^6}{29.14} \approx 5.66 \text{ Gbps}
+$$
 
 Translated to bandwidth:
 
@@ -966,18 +971,6 @@ plugin/cpu/
 ```
 
 Invoke with `-user_plugin ../plugin/cpu`. Box0 gets `cpu_stub`; Box1 keeps the parser unchanged.
-
-### 8.3 Timing closure
-
-The parser closes timing comfortably:
-
-```
-WNS (worst negative slack):     +7.386 ns
-WHS (worst hold slack):         +0.025 ns
-TNS (total negative slack):     0 ns
-```
-
-The 322 MHz CMAC domain and the 250 MHz Box0 domain have separate clock-converter IPs on AXI-Lite paths; there are no cross-domain timing exceptions required.
 
 ---
 
