@@ -4,7 +4,7 @@
 
 ---
 ## Group Members
-<img src="Headshots/roshni_headshot.png" alt="Roshni Mathew Headshot" width="210"/>
+<img src="Headshots/roshni_headshot.png" alt="Roshni Mathew Headshot" width="205"/>
 
 **Roshni Mathew**, Team Leader
 
