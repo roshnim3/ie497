@@ -4,6 +4,7 @@
 
 ---
 ## Group Members
+<img src="Headshots/roshni_headshot.png" alt="Roshni Mathew Headshot" width="210"/>
 
 **Roshni Mathew**, Team Leader
 
@@ -17,7 +18,8 @@ I am a senior in Computer Engineering with an interest in FPGAs, neural engineer
 
 [Personal Email](roshnimathew04@gmail.com)
 
-<img src="Documentation/member_headshots/suvid_headshot.jpg" alt="Suvid Singh Headshot" width="190"/>
+<img src="Headshots/suvid_headshot.png" alt="Suvid Singh Headshot" width="190"/>
+
 
 **Suvid Singh**, Team Member
 
