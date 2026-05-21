@@ -6,7 +6,10 @@
 
 ## Abstract
 
-High-frequency trading requires decisions within microseconds of market-data arrival — a budget that general-purpose processors paired with software-based parsing and conventional memory-mapped I/O cannot reliably meet. This thesis presents a co-designed two-stage architecture that moves both ends of the tick-to-trade pipeline onto dedicated hardware. A custom RISC-V processor is extended with four new instructions that bypass the standard memory-access path: one reads pre-parsed market-data fields from an on-chip buffer in 59 cycles against 105 for the equivalent memory-mapped load — a 1.78× single-shot speedup — and three more compose a transmit primitive that lets software stage Ethernet order frames across eight hardware-managed buffers and fire them with a single instruction. Cycle-accurate simulation measures an end-to-end tick-to-trade latency of 94 cycles (roughly 290 nanoseconds at 322 MHz) with sustained transmit throughput of 5.66 Gbps. On the network side, a Verilog packet-parser plugin synthesized into the OpenNIC framework on a Xilinx Alveo U55C decodes MoldUDP64-encapsulated ITCH messages from the 100-gigabit Ethernet interface and exposes the parsed fields to host software through PCIe-readable status registers, removing software decoding from the critical path. The two subsystems together quantify the latency gains achievable by displacing both market-data ingestion and order emission from commodity-core software to purpose-built silicon.
+ In industries like High-Frequency Trading (HFT), FPGAs have become critical over the past decade because firms rely on speed to analyze market data, respond to order book changes, and execute trades. The faster a firm can carry out a trade, the more relevant it remains, stimulating innovation in hardware acceleration.  A bottleneck in HFT pipelines is the connection between the custom FPGA logic and a general-purpose CPU. After data is parsed in hardware, it is handed off to the CPU through interrupts, memory-mapped buffers, or system calls, all of which add latency. This project explores how we can improve that interface. Specifically, we’re interested in how adding custom instructions to a RISC-V softcore can improve latency. We want to measure how much faster the CPU can access parsed market data using custom instructions compared to traditional memory-mapped I/O or software-based routes. 
+
+
+We have designed a two-stage architecture that moves both ends of the tick-to-trade pipeline onto dedicated hardware. A custom RISC-V processor is extended with four new instructions that bypass the standard memory-access path: one reads pre-parsed market-data fields from an on-chip buffer and three more compose a transmit primitive that lets software stage Ethernet order frames and fire them with a single instruction. We use simulation to measure the cycle latency to compare different methods. On the network side, a Verilog packet-parser plugin synthesized into the OpenNIC framework on a Xilinx Alveo U55C decodes MoldUDP64-encapsulated ITCH messages from the 100-gigabit Ethernet interface and exposes the parsed fields to host software through PCIe-readable status registers, removing software decoding from the critical path. The two subsystems together quantify the latency gains achievable by creating dedicated hardware for tasks typically done in software 
 
 ---
 
@@ -32,27 +35,18 @@ High-frequency trading requires decisions within microseconds of market-data arr
 
 ## 0. Fresh Clone Checklist
 
-The exact order of operations to go from `git clone` to a working parser demo. Cross-references point to the section that explains each step in full. Do these in order; do not skip steps.
+Below we have included steps for getting started. 
 
 ```bash
-# === ON ANY MACHINE WITH GIT ACCESS ===
-
-# (1) Clone with submodules. ${CLONE_PATH} is wherever you want — no assumption
-#     is made about home directories.
-git clone --recursive \
-    https://gitlab.engr.illinois.edu/ie497_ie597_independent_study_spring_2026/ie497_spring_2026_group_01/group_01_project.git \
-    ${CLONE_PATH}                                                  # see §5
+# (1) Clone with submodules. ${CLONE_PATH} is wherever you want the repo to sit         see §5
+git clone --recursive https://gitlab.engr.illinois.edu/ie497_ie597_independent_study_spring_2026/ie497_spring_2026_group_01/group_01_project.git ${CLONE_PATH}                                
 cd ${CLONE_PATH}
 
-# === ON THE BUILD MACHINE (hft06 by default) ===
+# (2) Source Vivado on the build machine. Adjust this version based on what your machine has
+source /tools/Xilinx/Vivado/2024.2/settings64.sh 
+vivado -version                                                  
 
-# (2) Source Vivado on the build machine. Final bitstream was built with
-#     Vivado 2024.2 — adjust the version below if your host has a different
-#     install under /tools/Xilinx/Vivado/ (see §3.2).
-source /tools/Xilinx/Vivado/2024.2/settings64.sh
-vivado -version                                                   # record this output
-
-# (3) Build the parser bitstream inside tmux. Takes 3–5 hours.        see §8
+# (3) Build the parser bitstream inside tmux. Ctrl-B D to detach.      see §8
 tmux new -s build_parser
 cd open-nic-shell/script
 vivado -mode batch -source ./build.tcl -tclargs \
@@ -60,47 +54,56 @@ vivado -mode batch -source ./build.tcl -tclargs \
     -user_plugin ../plugin/p2p \
     -impl 1 -post_impl 1 -overwrite 1 -jobs 8 \
     2>&1 | tee ../build_final.log
-# Ctrl-B D to detach. tmux attach -t build_parser to reconnect.
+# tmux attach -t build_parser to reconnect. 
 
-# === ON THE FPGA HOST (hft03) ===
 
-# (4a) Install the four root-owned wrappers. One-time per host.       see §5.1
+# (4) Install the four root-owned wrappers. One-time per host. Only needed if you don't have sudo access       see §5.1
 sudo install -m 0755 -o root -g root open-nic-shell/script/setup_device.sh  /usr/local/bin/setup_open_nic_device
 sudo install -m 0755 -o root -g root open-nic-shell/script/program_fpga.sh  /usr/local/bin/program_open_nic_fpga
 sudo install -m 0755 -o root -g root open-nic-shell/script/bar_read.py      /usr/local/bin/bar_read
 sudo install -m 0755 -o root -g root open-nic-shell/script/bar_write.py     /usr/local/bin/bar_write
 
-# (4b) Sudoers rule: this step is performed by the lab administrator,    see §4.1
-#      NOT by the commands in (4a). Ask the course instructor to install
-#      /etc/sudoers.d/sp26-ie497-dl-grp01 with the contents given in §4.1
-#      and to add your account to the sp26-ie497-dl-grp01 Unix group.
 
 # (5) Program the FPGA.                                              see §9
+lspci -nn -d 10ee:903f # Example: 83:00.0 Memory controller [0580]: Xilinx Corporation Device [10ee:903f]
+
+# Then set EXTENDED_DEVICE_BDF1 to "0000:<bus>:<dev>.<func>" from above line.
 export EXTENDED_DEVICE_BDF1=0000:83:00.0
 sudo -E /usr/local/bin/program_open_nic_fpga \
     open-nic-shell/build/au55c_final/open_nic_shell/open_nic_shell.runs/impl_1/open_nic_shell.bit \
     au55c
 
-# (6) Load the onic driver. Locate onic.ko once and use that path.    see §9.4
-sudo find / -name onic.ko 2>/dev/null
-sudo insmod <path-from-step-above>
+# (6) Clone repo and load the onic driver
+git clone https://github.com/Xilinx/open-nic-driver ${DRIVER-PATH}
+cd ${DRIVER-PATH}
+sudo insmod onic.lo
 
-# (7) Configure the network interface + static ARP.                  see §9.5
-sudo ip link set ens2 up
-sudo ip addr add 10.0.0.3/24 dev ens2
-sudo arp -i ens2 -s 10.0.0.99 02:00:00:00:00:99
+# (7) Configure the network interface + static ARP. # The values we have picked below are choices made for our loopback test and can be changed.                                            see §5.3, §9.5
+# IFACE: netdev name Linux assigns to the U55C after `modprobe onic`. hft03 default: ens2
+# HOST_IP: host-side address on the loopback subnet. Any unused address in a private /24 works; we picked 10.0.0.3 because the lab doesn't route 10.0.0.0/8 anywhere else.
+# DST_IP: destination for outbound test packets. 
+# DST_MAC a locally-administered MAC (02:* = no real OUI) we statically map to DST_IP so the kernel transmits UDP without waiting on an ARP reply that will never come. The trailing :99 is a mnemonic matching the .99 of DST_IP.
 
-# (8) Sanity-check the parser is reachable.                          see §9.6
+ip -br link
+IFACE=ens2 
+HOST_IP=10.0.0.3/24
+DST_IP=10.0.0.99
+DST_MAC=02:00:00:00:00:99
+
+sudo ip link set "$IFACE" up
+sudo ip addr add "$HOST_IP" dev "$IFACE"
+sudo arp -i "$IFACE" -s "$DST_IP" "$DST_MAC"
+
+# (8) Sanity-check the parser is reachable. 
+export OPENNIC_BDF=<your-bdf>  # find the right PCIe device (see §5.2).                         see §9.6
 sudo bar_read 0x200000      # expect: 0x49544348  ("ITCH")
 
 # (9) Run the end-to-end demo.                                       see §10
 python3 open-nic-shell/script/read_parser_regs.py > /tmp/before.txt
-python3 open-nic-shell/script/send_itch.py --src-ip 10.0.0.3 --dst-ip 10.0.0.99 --count 5 --interval 0.2
+python3 open-nic-shell/script/send_itch.py --src-ip "$HOST_IP" --dst-ip "$DST_IP" --count 5 --interval 0.2
 python3 open-nic-shell/script/read_parser_regs.py > /tmp/after.txt
 diff /tmp/before.txt /tmp/after.txt
 ```
-
-If you are running on a host other than `hft03`, additionally `export OPENNIC_BDF=<your-bdf>` before step (8) so `bar_read` / `bar_write` find the right PCIe device (see §5.2).
 
 The remainder of the report explains why each step looks like this, what failure modes to watch for, and what the expected results are.
 
@@ -110,56 +113,173 @@ The remainder of the report explains why each step looks like this, what failure
 
 ### 1.1 Problem statement
 
-In production HFT environments the critical path between an inbound market-data packet arriving on the wire and an outbound order leaving the wire is budgeted in hundreds of nanoseconds. Of that budget, software running on a general-purpose CPU typically spends:
+In a conventional pipeline, getting market data into a CPU register and getting an order back out onto the wire both rely on general-purpose mechanisms that pay the full cost of the load-store unit and the kernel:
 
-- 40–200 ns parsing the inbound market-data feed (NASDAQ ITCH or equivalent)
-- 30–80 ns servicing kernel-mediated network I/O
-- 60–150 ns on memory-mapped I/O reads against external accelerators
+- If parsing is done in software, the CPU walks the raw NASDAQ ITCH / MoldUDP64 byte stream itself — extracting the message type, stock locate, price, and shares with general-purpose loads, shifts, and branches.
+- If parsing has already been offloaded to an accelerator, the CPU still has to read the parsed fields back via memory-mapped I/O. Each lw traverses the load-store unit, the cache hierarchy, and the PCIe root complex before reaching the accelerator's register file.
+- Emitting the outbound order goes through the kernel networking stack — a system call, an sk_buff allocation, a user-to-kernel copy, and a doorbell write to the NIC.
 
-Each of these is software-visible work that pays the full cost of a cache-traversing load or a non-bypassable instruction-fetch pipeline. The thesis question is whether displacing these stages into purpose-built hardware — a custom ISA extension on the processor side and a programmable FPGA parser on the network side — produces a measurably shorter critical path.
+Each of these uses a general-purpose mechanism (cache-traversing load, kernel transition, full instruction-fetch pipeline) for what is, semantically, a single data transfer.
+
+The thesis question this project investigates is: if each of these is instead expressed as a dedicated RISC-V instruction backed by on-chip hardware, how much shorter does the critical path become — measured in CPU cycles on an apples-to-apples comparison against the conventional software-parse and MMIO baselines of the same workload?
 
 ### 1.2 Two-stage architecture
 
 The system is co-designed in two halves that can be reasoned about and validated independently:
 
 ```
-       ┌─────────────────────────────────────────┐
-       │           FPGA  (Xilinx U55C)           │
-       │  ┌────────┐    ┌──────────┐   ┌──────┐  │       ┌──────────┐
-Wire ──┼─▶│ 100 G  │───▶│ ITCH     │──▶│ BAR2 │──┼──────▶│  Host    │
-       │  │ CMAC   │    │ parser   │   │ regs │  │ PCIe  │  (Linux) │
-       │  └────────┘    └──────────┘   └──────┘  │       └──────────┘
-       │      ▲                                  │            │
-       │      │  (CMAC TX)                       │            │
-       │      │                                  │            │
-       │      └──────────────────────────────────┼────────────┘
-       │                                         │  kernel-emitted UDP
-       └─────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────┐
+│            Custom RV32IM Out-of-Order Core  (VCS simulation, EWS)              │
+│                                                                                │
+│   Fetch ──▶ Decode ──▶ Rename ──▶ Dispatch                                     │
+│                                       │                                        │
+│                                       ▼                                        │
+│    ┌──────────────────────────────────────────────────────────────────────┐    │
+│    │  Rename / Retire State                                               │    │
+│    │     RAT  ·  PRF (64 physical × 32 b)  ·  ROB (32 entries → RRAT)     │    │
+│    └─────────────────────────▲──────────────────────────────▲─────────────┘    │
+│                              │ operand read                 │ writeback        │
+│                              │                              │                  │
+│    ┌─────────────────────────┴───┐    ┌─────────────────── CDBs ──────────┐    │
+│    │  Reservation Stations       │    │                                   │    │
+│    │   RS_ALU    ─────────────▶  │    │  ALU  ┐                           │    │
+│    │   RS_BR     ─────────────▶  │    │  BR   ├──▶ cdb_alu_br  ───────────┼───▶│
+│    │   RS_MEM    ─────────────▶  │───▶│  MEM  ────▶ cdb_mem    ───────────┼───▶│
+│    │   RS_MUL    ─────────────▶  │    │  MUL ┐                            │    │
+│    │   RS_DIV    ─────────────▶  │    │  DIV ┤  priority arb              │    │
+│    │   RS_TRADE  ─────────────▶  │    │  FT  ┤  + 1-deep bufs             │    │
+│    │   RS_PKTTX  ─────────────▶  │    │  PT  ┘ ──▶ cdb_mul_div ───────────┼───▶│
+│    └─────────────────────────────┘    └───────────────────────────────────┘    │
+│                                                                                │
+│──── fetch_trade FU backing store ──────────────────────────────────────────────│
+│                                                                                │
+│     xpm_memory_sdpram  ·  8 packets × 8 slots × 32 bit                         │
+│      Port A (write) ◀── behavioral parser (hvl/common/fake_packet_parser.sv)   │
+│      Port B (read)  ◀── FT FU returns slot to cdb_mul_div in 2 cycles          │
+│                                                                                │
+│──── pkt_tx FU backing store ───────────────────────────────────────────────────│
+│                                                                                │
+│     Staging BRAM  ·  8 slots × 16 words × 32 bit                               │
+│      Port A (write) ◀── PT FU, one word per pkt_w                              │
+│      Port B (read)  ──▶ drain FSM (IDLE → SEND → IDLE on pkt_s)                │
+│                                       │                                        │
+│                                       ▼                                        │
+│                          AXI-Stream master (m_axis_pkt_tx_*)                   │
+│                          1 × 32-bit beat per cycle  ──▶ order frame            │
+└────────────────────────────────────────────────────────────────────────────────┘
+
 ```
 
 ```
-                   ┌──────────────────────────────────────────────┐
-                   │  Custom RV32IM OoO core (VCS simulation)     │
-                   │                                              │
-   parsed trade ──▶│  fetch_trade rd, imm    (custom-1)           │
-                   │       │                                      │
-                   │       ▼                                      │
-                   │  decision logic (RV32I)                      │
-                   │       │                                      │
-                   │       ▼                                      │
-                   │  pkt_w / pkt_s / pkt_st  (custom-2)          │──▶ AXI-Stream
-                   │                                              │     order frame
-                   └──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────┐
+│      Xilinx Alveo U55C   ·   OpenNIC framework   ·   our plugin in Box1        │
+│                                                                                │
+│   Wire (QSFP)                                                                  │ 
+│       │                                                                        │
+│       ▼                                                                        │
+│   ┌───────────────────────────┐                                                │
+│   │ 100G CMAC subsystem       │                                                │
+│   │ Xilinx UltraScale+ IP     │                                                │
+│   │ PCS internal loopback     │                                                │
+│   └───┬────────────────────▲──┘                                                │
+│       │ RX (512 b @ 322MHz)│ TX                                                │
+│       ▼                    │                                                   │
+│   ┌────────────────────────────────────────────────────────────────────────┐   │
+│   │   Box1 @ 322 MHz  —  plugin/p2p/p2p_322mhz.sv                          │   │
+│   │                                                                        │   │
+│   │     parser snoop on s_axis_cmac_rx ──▶ pass-through to adapter ──────┐ │   │
+│   │            │                                                         │ │   │
+│   │            ▼                                                         │ │   │
+│   │     packetparser_322mhz_simple.sv                                    │ │   │
+│   │       decodes  Ethernet → IPv4 → UDP → MoldUDP64 → ITCH              │ │   │
+│   │       msg types 'A' (0x41), 'i' (0x69), 'h' (0x68)                   │ │   │
+│   │            │                                                         │ │   │
+│   │            ▼  parsed fields                                          │ │   │
+│   │     Shadow registers   (axil_aclk domain, CDC from cmac_clk)         │ │   │
+│   │       ├─ REG_MAGIC = 0x49544348 ("ITCH")                             │ │   │
+│   │       ├─ REG_LAST_* (msg_type, price, shares, sym, ref_num, IP…)     │ │   │
+│   │       ├─ REG_COUNT_* (per-type counters)                             │ │   │
+│   │       └─ REG_DBG_*   (7 diagnostic counters, see §13.4)              │ │   │
+│   │            │                                                         │ │   │
+│   │            ▼                                                         │ │   │
+│   │     AXI-Lite slave   ─── 33 regs at BAR2 0x200000–0x2000FF.          │ │   │
+│   └──────────────┬───────────────────────────────────────────────┬───────┬─┘   │
+│                  │ AXI-Lite                                      │       │     │
+│                  ▼                                               ▼       │     │
+│         OpenNIC AXI-Lite crossbar                Packet adapter (250 MHz)│     │
+│                  │                                               │       │     │
+│                  │                                               ▼       │     │
+│                  │                                       ┌─────────────┐ │     │
+│                  │                                       │  QDMA (PCIe │◀┘     │
+│                  │                                       │  Gen3)      │       │
+│                  │                                       └──────┬──────┘       │
+│                  │ PCIe (BAR2 MMIO)                             │ PCIe (data)  │
+│                  ▼                                              ▼              │
+│   ┌──────────────────────────────────────────────────────────────────────┐     │
+│   │ Host (hft03, Linux)                                                  │     │
+│   │   • onic driver → netdev ens2  (kernel TX/RX through QDMA)           │     │
+│   │   • send_itch.py emits MoldUDP64+ITCH UDP via ens2 (loops at CMAC)   │     │
+│   │   • bar_read / read_parser_regs.py read parsed fields out of BAR2    │     │
+│   └──────────────────────────────────────────────────────────────────────┘     │
+└────────────────────────────────────────────────────────────────────────────────┘
+
 ```
 
 The FPGA side is validated on real silicon (Xilinx U55C, PCIe-attached). The CPU side is validated via cycle-accurate simulation in Synopsys VCS.
+
+### 1.3 Headline results
+
+This section overviews what we measured and what each measurement was designed to answer. All CPU cycle numbers are from VCS simulation on EWS and nanosecond measurements approximated assuming the 322 MHz CMAC clock.
+
+#### 1. Custom instruction vs MMIO vs software (RX-side baseline)
+
+We created three firmware implementations of the same ITCH decision predicate: [itch_software.c](riscv-cpu/testcode/sim_b/itch_software.c) parses raw bytes in software, [itch_mmio.c](riscv-cpu/testcode/sim_b/itch_mmio.c) reads pre-parsed fields via `lw` from a memory-mapped BRAM, and [itch_custom.c](riscv-cpu/testcode/sim_b/itch_custom.c) reads the same fields via the new `fetch_trade` instruction. 
+
+
+| Path | Single-shot (cyc) | Steady-state (cyc/event) | ILP-saturated (cyc/event) |
+|---|---|---|---|
+| Software parse | 234 | 55.0 | 51.2 |
+| MMIO `lw` | 105 | 29.0 | 27.1 |
+| `fetch_trade` | **59** | **26.0** | 27.1 |
+
+Then we ran a single-shot, swept over ITER ∈ {1, 10, 100, 1000} for steady-state and re-measured under an ILP-saturated mixed workload.
+
+| Custom Instruction Speedup | vs MMIO | vs software |
+|---|---|---|
+| Single-shot | **1.78×** | **4.0×** |
+| Steady-state | 1.12× | 2.12× |
+| ILP-saturated | 1.00× | 1.89× |
+
+
+These benchmarks are meant to show that the lifting an  read out of the LSU/cache/PCIe path into a dedicated functional unit produce a measurable cycle. 
+
+#### 2. FPGA parser end-to-end on silicon
+
+[send_itch.py](open-nic-shell/script/send_itch.py) emits real MoldUDP64-encapsulated ITCH Add Order packets through the host kernel into the `ens2` netdev; the 100 G CMAC loops them back via PCS internal loopback; the parser in [packetparser_322mhz_simple.sv](open-nic-shell/plugin/p2p/packetparser_322mhz_simple.sv) decodes Ethernet → IPv4 → UDP → MoldUDP64 → ITCH; [read_parser_regs.py](open-nic-shell/script/read_parser_regs.py) reads every decoded field out of BAR2.
+
+Every result above this point is simulation. This is the one result that runs on real hardware (Xilinx Alveo U55C in `hft03`).
+
+**Result.**
+
+| Sender wrote | Parser decoded | Match |
+|---|---|---|
+| `msg_type = 'A'` | `REG_LAST_MSG_TYPE = 0x41` | ✓ |
+| `buy_sell = 'B'` | `REG_LAST_BUY_SELL = 0x42` | ✓ |
+| src/dst IP `10.0.0.3` / `10.0.0.99` | `0x0A000003` / `0x0A000063` | ✓ |
+| `stock_locate = 0x1234` | `REG_LAST_STOCK_LOCATE = 0x1234` | ✓ |
+| `ref_num = 0x0123ABCD000186A5` | `REG_LAST_REF_NUM_HIGH/LOW` matches | ✓ |
+| `shares = 1004` | `REG_LAST_SHARE_AMT = 0x000003EC` | ✓ |
+| `stock_sym = "AAPL    "` | `REG_LAST_STOCK_SYM_*` = `"AAPL" + spaces` | ✓ |
+| `price = 9989684` | `REG_LAST_PRICE = 0x00986E34` | ✓ |
+| `sequence = 5` | `REG_LAST_SEQ_LOW = 0x00000005` | ✓ |
+
+The full field-by-field comparison from a 5-packet demo run is in §12.3.
 
 ## 2. Repository Structure
 
 ```
 ie497/                                 ← top-level project repo
-├── README.md                          ← brief landing description
-├── REPORT.md                          ← this document
+├── README.md                          ← this document
 ├── .gitmodules                        ← submodule pointers
 │
 ├── open-nic-shell/                    ← FPGA parser (submodule)
@@ -197,7 +317,7 @@ ie497/                                 ← top-level project repo
     └── run.sh                         ← top-level sim invocation
 ```
 
-The two subprojects are independent — the CPU sim does not depend on the FPGA build, and vice versa. They share an architectural model (the parser drives the same field layout the CPU side reads), but no code or build artifacts.
+The two subprojects are independent — the CPU sim does not depend on the FPGA build, and vice versa. They share an architectural model (the parser drives the same field layout the CPU side reads)
 
 ---
 
@@ -367,15 +487,39 @@ sudo -E bar_read 0x200000          # the -E preserves the env var across sudo
 
 ### 5.3 Host network configuration on `hft03`
 
-After the FPGA is programmed (§9), the OpenNIC interface comes up as `ens2`. We use a static unrouted subnet, with a manual ARP entry so the kernel will transmit UDP without ARP resolution depending on the (deliberately absent) network partner:
+After the FPGA is programmed (§9), the OpenNIC interface enumerates as a Linux netdev. We configure it for an isolated loopback test subnet, with a manual ARP entry so the kernel will transmit UDP without ARP resolution depending on a (deliberately absent) network partner:
 
 ```bash
-sudo ip link set ens2 up
-sudo ip addr add 10.0.0.3/24 dev ens2
-sudo arp -i ens2 -s 10.0.0.99 02:00:00:00:00:99
+# All four of these are project choices, not physical constants.
+# Adjust if your environment requires different values.
+
+IFACE=ens2                       # netdev name on hft03 after `modprobe onic`
+HOST_IP=10.0.0.3/24              # this host's address on the test subnet
+DST_IP=10.0.0.99                 # synthetic destination for UDP test packets
+DST_MAC=02:00:00:00:00:99        # locally-administered MAC for DST_IP
+
+sudo ip link set "$IFACE" up
+sudo ip addr add "$HOST_IP" dev "$IFACE"
+sudo arp -i "$IFACE" -s "$DST_IP" "$DST_MAC"
 ```
 
-`10.0.0.99` is the deliberately unassigned destination IP we send UDP test packets to. The static ARP entry pre-resolves it to a synthetic MAC so the Linux kernel will transmit the UDP frame without waiting for an ARP reply that will never come (the CMAC's PCS internal loopback returns the frame to ourselves rather than to any partner).
+#### Where each value comes from
+
+- **`IFACE` (default `ens2`).** The Linux kernel assigns this name when the `onic` driver binds to the U55C's PCIe device. The exact name depends on the kernel's *predictable network interface names* rules — bus, slot, function — which are themselves a function of the host's PCIe topology. On `hft03` the U55C lives at BDF `0000:83:00.0` and the resulting netdev is consistently `ens2` across reboots. On any other host, run `ip -br link` after `modprobe onic` and use whatever name appears with a Xilinx MAC OUI (`00:0a:35:...`).
+
+- **`HOST_IP` (default `10.0.0.3/24`).** Our chosen address for the host side of the loopback test subnet. The `10.0.0.0/8` range is RFC 1918 private space; the lab's actual networks use different subnets, so this address never conflicts with real routing. The `.3` is arbitrary — any unused address in an unused `/24` works. The `/24` mask keeps the test subnet small.
+
+- **`DST_IP` (default `10.0.0.99`).** A *deliberately unassigned* destination address. The whole point of this value is that nothing is at `.99`. When `send_itch.py` targets `10.0.0.99`, the Linux kernel routes the packet via `IFACE` (because the destination is in the local `/24` subnet), the packet leaves through CMAC TX, and — because the CMAC is configured for PCS internal loopback (§13.1) — it returns through CMAC RX directly to the parser. No external network partner is involved or needed.
+
+- **`DST_MAC` (default `02:00:00:00:00:99`).** A synthetic destination MAC we statically map to `DST_IP` via `arp -s`. The `02:` prefix marks this as a locally-administered address (the IEEE convention for MACs that don't correspond to a real vendor OUI), so it cannot collide with any factory-assigned MAC. The trailing `:99` mnemonically matches the `.99` of `DST_IP`. **The static ARP entry is the load-bearing piece**: without it, the kernel would broadcast ARP requests for `10.0.0.99`, get no reply (because nothing exists at that address — including ourselves, since `10.0.0.99` is not assigned to our `IFACE`), and eventually drop the queued UDP packets. With the static entry, the kernel believes ARP is already resolved and transmits the UDP frame immediately, which is what we want the parser to see.
+
+#### On a different host
+
+If you are bringing this project up somewhere other than `hft03`:
+
+1. Determine the netdev name from `ip -br link` after the `onic` driver loads, and assign it to `IFACE`.
+2. Keep `HOST_IP`, `DST_IP`, and `DST_MAC` unless they conflict with existing routing on your host — they're project choices, not requirements. Any pair of addresses in an unused RFC 1918 `/24` works as long as `HOST_IP` is the host's address on that subnet and `DST_IP` is a different unassigned address in the same `/24`.
+3. The `send_itch.py` `--src-ip` and `--dst-ip` arguments must match whatever you set above (see §10).
 
 ---
 
