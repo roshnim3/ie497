@@ -79,10 +79,6 @@ cd ${DRIVER-PATH}
 sudo insmod onic.lo
 
 # (7) Configure the network interface + static ARP. # The values we have picked below are choices made for our loopback test and can be changed.                                            see §5.3, §9.5
-# IFACE: netdev name Linux assigns to the U55C after `modprobe onic`. hft03 default: ens2
-# HOST_IP: host-side address on the loopback subnet. Any unused address in a private /24 works; we picked 10.0.0.3 because the lab doesn't route 10.0.0.0/8 anywhere else.
-# DST_IP: destination for outbound test packets. 
-# DST_MAC a locally-administered MAC (02:* = no real OUI) we statically map to DST_IP so the kernel transmits UDP without waiting on an ARP reply that will never come. The trailing :99 is a mnemonic matching the .99 of DST_IP.
 
 ip -br link
 IFACE=ens2 
@@ -273,7 +269,7 @@ Every result above this point is simulation. This is the one result that runs on
 | `price = 9989684` | `REG_LAST_PRICE = 0x00986E34` | ✓ |
 | `sequence = 5` | `REG_LAST_SEQ_LOW = 0x00000005` | ✓ |
 
-The full field-by-field comparison from a 5-packet demo run is in §12.3.
+
 
 ## 2. Repository Structure
 
@@ -327,13 +323,12 @@ The two subprojects are independent — the CPU sim does not depend on the FPGA 
 
 | Hostname | Role | Has U55C? | Has Vivado? | Has VCS? | OS / Kernel |
 |---|---|---|---|---|---|
-| `hft03` | FPGA host, parser bring-up | **Yes** (BDF `0000:83:00.0`) | Yes | No | Ubuntu / Linux 5.15.0-177-generic |
-| `hft06` | Vivado build machine | No | Yes | No | Ubuntu / Linux 5.15.x |
-| EWS (UIUC Engineering Workstations) | CPU simulation | No | No | **Yes** (Synopsys VCS) | RHEL 8 / Linux 4.18 |
+| `hft03` | FPGA host, parser bring-up | **Yes** | **Yes** | No | Ubuntu / Linux 5.15.0-177-generic |
+| `hft06` | Vivado build machine | No | **Yes** | No | Ubuntu / Linux 5.15.x |
+| EWS (UIUC Engineering Workstations) | CPU simulation | No | No | **Yes**| RHEL 8 / Linux 4.18 |
 
-Builds can run on either `hft03` or `hft06`; both have Vivado. We typically run parser builds on `hft06` so `hft03` is free for programming and testing.
 
-The CPU simulation does **not** synthesize on Vivado because the baseline RV32IM core uses Synopsys DesignWare IP (`DW02_mult`, `DW_div_seq`) which is ASIC-only. All cycle-accurate CPU numbers are measured in VCS on EWS.
+The original CPU simulation does **not** synthesize on Vivado because the baseline RV32IM core uses Synopsys DesignWare IP (`DW02_mult`, `DW_div_seq`) which is ASIC-only. However our latest step was to remove the multiply and divide unit because for our purposes it was not needed in order to make it so the CPU can synthesize on Vivado. All cycle-accurate CPU numbers are measured in VCS on EWS.
 
 ### 3.2 Tool versions
 
@@ -354,19 +349,18 @@ echo "$LM_LICENSE_FILE"
 
 The final parser bitstream was built with **Vivado 2024.2** on `hft06`. The installation lives at `/tools/Xilinx/Vivado/2024.2/`, and the `vivado` binary used is `/tools/Xilinx/Vivado/2024.2/bin/vivado`. The build TCL is version-agnostic — any UIUC Vivado lab install that supports the `au55c` board file and the 100G CMAC v3.1 IP will produce an equivalent bitstream — but the table below reflects the specific install we exercised.
 
-XRT (Xilinx Runtime) is **not** required for this project's tested flow. The parser is programmed via Vivado's hardware manager invoked from `program_fpga.sh`, and host-side access is through `/sys/bus/pci/.../resource2` and the standard `onic` kernel module — neither path uses XRT.
 
 #### Full tool inventory
 
 | Tool | Where used | Version | Notes |
 |---|---|---|---|
-| Xilinx Vivado | `hft06` (parser bitstream); `hft03` available as backup | **2024.2** (`/tools/Xilinx/Vivado/2024.2/bin/vivado`) | Source `/tools/Xilinx/Vivado/2024.2/settings64.sh` before running the build. |
-| Xilinx 100G CMAC IP | inside Vivado | v3.1 (`CONFIGURATION_REVISION_REG = 0x00000301` confirmed via BAR read after bring-up) | Licensed; available through the campus Xilinx license server. |
+| Xilinx Vivado | `hft06` (parser bitstream)| **2024.2**  | Source `/tools/Xilinx/Vivado/2024.2/settings64.sh` before running the build. |
+| Xilinx 100G CMAC IP | inside Vivado | v3.1 | Licensed; available through the campus Xilinx license server. |
 | Synopsys VCS | EWS workstations | as installed on EWS (2024.x line) | invoked through the CPU repo's existing `sim/Makefile`. No build customization. |
 | RISC-V GCC | EWS workstations | `riscv64-unknown-elf-gcc` from the EWS toolchain (run `riscv64-unknown-elf-gcc --version` to capture) | `--march=rv32i_zicsr --mabi=ilp32` after the M-extension was deleted; `rv32im` on the original baseline branch. |
 | Python | `hft03`, `hft06`, EWS | 3.8 or newer | `bar_read.py`, `bar_write.py`, `read_parser_regs.py`, `send_itch.py`, `send_raw_bytes.py` are pure Python 3, no external packages required. |
 | `setpci`, `lspci`, `tcpdump`, `ethtool`, `ip`, `arp` | `hft03` | system default (Ubuntu) | Used during programming and bring-up. |
-| XRT | _not used_ | — | The OpenNIC flow does not depend on XRT. |
+
 
 ### 3.3 OpenNIC dependencies
 
@@ -380,7 +374,7 @@ All IPs are instantiated through the `.tcl` files committed in `open-nic-shell/s
 
 ### 3.4 Host PCIe device identity (on `hft03`)
 
-The Xilinx Alveo U55C accelerator on `hft03` is permanently enumerated at:
+The Xilinx Alveo U55C accelerator on `hft03` is  enumerated at:
 
 | Property | Value |
 |---|---|
@@ -410,29 +404,13 @@ File: `/etc/sudoers.d/sp26-ie497-dl-grp01`
 %sp26-ie497-dl-grp01 ALL=(ALL) NOPASSWD: /usr/local/bin/bar_write *
 ```
 
-**Design note.** Every path in the rule is a system-level absolute path under `/usr/local/bin/`. Nothing points into any user's home directory. The four binaries referenced are root-owned 0755 wrappers installed once per host from the repository (see §5.1). This satisfies the design requirement that no reproducible step depend on a particular user's account name.
 
 ### 4.2 What each grant covers
 
-- **`setup_open_nic_device *` and `program_open_nic_fpga *`** — Root-owned 0755 wrappers around the repo's `script/setup_device.sh` and `script/program_fpga.sh`. They internally call `setpci`, `tee /sys/bus/pci/devices/.../remove`, `tee /sys/bus/pci/devices/.../rescan`, and `rmmod` / `insmod` on the `onic` kernel module. Granting NOPASSWD on the *wrappers* (rather than on each underlying system command) keeps the privilege footprint tight. Because the wrappers are root-owned and not writable by unprivileged users, group members cannot edit them to escape the intended scope.
+- **`setup_open_nic_device *` and `program_open_nic_fpga *`** — Root-owned 0755 wrappers around the repo's `script/setup_device.sh` and `script/program_fpga.sh`. They internally call `setpci`, `tee /sys/bus/pci/devices/.../remove`, `tee /sys/bus/pci/devices/.../rescan`, and `rmmod` / `insmod` on the `onic` kernel module. 
 
 - **`/usr/local/bin/bar_read *` and `/usr/local/bin/bar_write *`** — Python helpers (described in §7.5) that `mmap`-read or `mmap`-write 32-bit words from BAR2 of a specific PCIe device, with bounds checking against the BAR size reported by `fstat`. The 4-byte access size and the per-call BAR-size verification make them safe to expose at group level. They honor the `OPENNIC_BDF` environment variable (defaulting to `0000:83:00.0` for `hft03`'s U55C) so the same binaries work on any host whose U55C is enumerated at a different bus/device/function.
 
-The scoped wildcard `*` after each rule lets group members pass arbitrary register offsets and (for `bar_write`) values, while still preventing them from invoking any other binary on the system through sudo.
-
-### 4.3 Membership requirement
-
-The user account performing FPGA bring-up must be a member of the Unix group `sp26-ie497-dl-grp01`. Verify with:
-
-```bash
-id | tr ',' '\n' | grep sp26-ie497-dl-grp01
-```
-
-If the group does not appear, log out and back in (the group may have been added after the current session started) or request membership from the course instructor.
-
-### 4.4 No CPU-side privileges required
-
-The cycle-accurate RISC-V simulation runs entirely as the user on EWS. No sudo is needed for anything in the `riscv-cpu/` subtree.
 
 ---
 
@@ -717,13 +695,7 @@ $ grep DW_ riscv-cpu/sim/vcs/compile.log
 $       # ← zero DesignWare references in VCS elaboration
 ```
 
-The strip removed approximately 735 net lines of code across 12 files:
 
-- `pkg/types.sv` (FU and RS type definitions cleaned of `FU_MUL` / `FU_DIV`)
-- Four files under `hdl/core/` (decode, rename, dispatch, top-level CPU)
-- `hdl/execution/prf.sv` (physical register file ports)
-- `bin/get_options.py` and `options.json` (toolchain target changed from `rv32im` to `rv32i_zicsr`)
-- Deleted: `hdl/execution/{mul,div,mul_rs,div_rs}.sv`
 
 The CDB arbiter priority chain collapsed from `DIV > mul_buf > MUL > trade_buf > TRADE > pkt_tx_buf > PKT_TX` to simply `trade_buf > TRADE > pkt_tx_buf > PKT_TX`. The shared `cdb_mul_div` signal name was preserved to minimize diff noise; it now carries only `fetch_trade` and `pkt_tx` writebacks.
 
@@ -752,7 +724,7 @@ The core is now in the state where it could be dropped into a Vivado project: it
 
 This section describes the hardware half of the project — a Verilog packet-parser plugin synthesized into the OpenNIC framework and running on the U55C accelerator card in `hft03`.
 
-### 7.0 Why OpenNIC, and how it fits the project
+### 7.1 Why OpenNIC, and how it fits the project
 
 **The framework.** OpenNIC ([github.com/Xilinx/open-nic](https://github.com/Xilinx/open-nic)) is a Xilinx-maintained open-source FPGA network-interface framework. It packages, in a single shell bitstream, every piece of plumbing that a programmable 100-gigabit NIC needs:
 
@@ -778,30 +750,6 @@ The OpenNIC half of the project advanced through four discrete strides, each of 
 
 The remainder of this section documents the technical structure that supports those four milestones.
 
-### 7.1 OpenNIC architecture, abridged
-
-OpenNIC ([Xilinx/open-nic](https://github.com/Xilinx/open-nic)) is an open-source FPGA framework providing:
-
-- 100 Gigabit Ethernet via the Xilinx CMAC subsystem
-- PCIe DMA via the Xilinx QDMA subsystem
-- Two user-logic regions (called "boxes") at separate clock frequencies (250 MHz and 322 MHz) into which custom plugins can be dropped
-- An AXI-Lite address map exposed to the host via PCIe BAR2
-
-System-level BAR2 address map (from `src/system_config/system_config_address_map.sv`):
-
-| Range | Module |
-|---|---|
-| `0x00000 – 0x00FFF` | System configuration |
-| `0x01000 – 0x05FFF` | QDMA subsystem #0 |
-| `0x08000 – 0x0AFFF` | CMAC subsystem #0 |
-| `0x0B000 – 0x0BFFF` | Packet adapter #0 |
-| `0x10000 – 0x11FFF` | Sysmon block |
-| `0x100000 – 0x1FFFFF` | **Box0 @ 250 MHz** |
-| **`0x200000 – 0x2FFFFF`** | **Box1 @ 322 MHz** — our parser lives here |
-| `0x300000 – 0x33FFFF` | Card management system |
-
-The parser plugin is placed at the base of Box1 (BAR2 offset `0x200000`).
-
 ### 7.2 Parser plugin
 
 Top-level file: `open-nic-shell/plugin/p2p/p2p_322mhz.sv`. The plugin exposes:
@@ -820,23 +768,7 @@ Inner parser FSM: `open-nic-shell/plugin/p2p/packetparser_322mhz_simple.sv`. The
 
 Any other message type byte falls into a `default` case that increments `COUNT_UNKNOWN`.
 
-### 7.3 Plugin data path
-
-```
-CMAC RX (322 MHz, 512 b AXI-Stream) ──┬──▶ s_axis_cmac_rx_* (parser snoops)
-                                       │
-                                       └──▶ m_axis_adap_rx_* (forwarded to QDMA)
-
-QDMA C2H → adap_rx (250 MHz)  ──▶ packet_adapter ──▶ host kernel
-
-QDMA H2C ← adap_tx (250 MHz) ◀── packet_adapter ◀── host kernel
-                                       │
-                                       └──▶ m_axis_cmac_tx_* (322 MHz)
-```
-
-The parser is purely a snoop on the CMAC RX path; it does not gate or modify the AXI-Stream that flows back up to the QDMA. The host's normal networking continues to function in parallel with parsing.
-
-### 7.4 AXI-Lite register map
+### 7.3 AXI-Lite register map
 
 Base address: BAR2 `0x200000`. All registers are 32 bits wide.
 
@@ -878,7 +810,7 @@ Base address: BAR2 `0x200000`. All registers are 32 bits wide.
 
 The seven diagnostic registers (offsets `0x6C` onward) were added during bring-up to isolate the byte-ordering issue described in §13. They remain in the final design as runtime instrumentation.
 
-### 7.5 Host-side tools
+### 7.4 Host-side tools
 
 All five tools live under `open-nic-shell/script/`:
 
@@ -1331,7 +1263,7 @@ The parser instead taps `s_axis_cmac_rx_*` *before* the adapter, so it sees raw 
 
 ### 13.1 Loopback-only end-to-end testing
 
-The FPGA parser has only been exercised under PCS internal loopback. We have not connected the U55C to an external 100 Gigabit Ethernet source. The PCS-loopback path exercises the full CMAC RX datapath, AXI-Stream presentation, and parser FSM exactly as a real link partner would, but cannot validate link-layer behaviors that depend on remote-end alignment (auto-negotiation, FEC convergence under bit errors, etc.).
+The FPGA parser has only been exercised under PCS internal loopback. We have not connected the U55C to an external 100 Gigabit Ethernet source. The PCS-loopback path exercises the full CMAC RX datapath, AXI-Stream presentation, and parser FSM exactly as a real link partner would, but cannot validate link-layer behaviors that depend on remote-end alignment.
 
 ### 13.2 Tier-3 multi-message coverage
 
@@ -1339,9 +1271,9 @@ The simple parser handles up to 2 ITCH messages per MoldUDP64 packet (Tier 3). P
 
 ### 13.3 CPU on FPGA — synthesizability achieved, integration deferred
 
-All cycle-accurate measurements in §6 were taken in VCS simulation on EWS. The original RV32IM core could not be synthesized in Vivado because of its Synopsys DesignWare dependency. We addressed the synthesizability blocker directly: as described in §6.10, the `roshnim/cpu-fpga` branch strips the M-extension, removes all DesignWare references, and verifies that the full benchmark regression set still passes with cycle-for-cycle identical results to the unstripped baseline. VCS elaboration of that branch produces a DesignWare-free compile log, and the toolchain target is set to `rv32i_zicsr`.
+All cycle-accurate measurements in §6 were taken in VCS simulation on EWS. The original RV32IM core could not be synthesized in Vivado because of its Synopsys DesignWare dependency. We addressed the synthesizability blocker directly: as described in §6.10, the `roshnim/cpu-fpga` branch strips the M-extension, removes all DesignWare references, and verifies that the full benchmark regression set still passes with cycle-for-cycle identical results to the unstripped baseline. 
 
-What remains for an actual FPGA bitstream containing the stripped core is **integration work, not core work**: writing a top-level synthesizable wrapper around the core, mapping the instruction and data memories to Xilinx BRAM primitives (the project's `xpm_memory_sdpram` instances already in use for `fetch_trade` and `pkt_tx` are FPGA-friendly), generating a CPU clock from a Vivado MMCM, and wiring the core's AXI-Lite interface into OpenNIC's Box0 region so the host can probe the core via PCIe BAR2. None of these steps requires further HDL modification of the core. Producing the integrated bitstream was not completed within the project's two-day final push but the prerequisite — getting the core into a synthesizable state without losing any custom-instruction functionality — is done.
+What remains for an actual FPGA bitstream containing the stripped core is integration work: writing a top-level synthesizable wrapper around the core, mapping the instruction and data memories to Xilinx BRAM primitives (the project's `xpm_memory_sdpram` instances already in use for `fetch_trade` and `pkt_tx` are FPGA-friendly), generating a CPU clock from a Vivado MMCM, and wiring the core's AXI-Lite interface into OpenNIC's Box0 region so the host can probe the core via PCIe BAR2. None of these steps requires further HDL modification of the core. 
 
 ### 13.4 Closed-system integration
 
@@ -1369,4 +1301,3 @@ We exercised the parser against synthetic MoldUDP64 packets emitted by `send_itc
 
 ---
 
-*End of report.*
