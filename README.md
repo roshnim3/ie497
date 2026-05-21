@@ -179,21 +179,34 @@ The system is co-designed in two halves that can be reasoned about and validated
 │    │   RS_PKTTX  ─────────────▶  │    │  PT  ┘ ──▶ cdb_mul_div ───────────┼───▶│
 │    └─────────────────────────────┘    └───────────────────────────────────┘    │
 │                                                                                │
-│──── fetch_trade FU backing store ──────────────────────────────────────────────│
-│                                                                                │
-│     xpm_memory_sdpram  ·  8 packets × 8 slots × 32 bit                         │
-│      Port A (write) ◀── behavioral parser (hvl/common/fake_packet_parser.sv)   │
-│      Port B (read)  ◀── FT FU returns slot to cdb_mul_div in 2 cycles          │
-│                                                                                │
-│──── pkt_tx FU backing store ───────────────────────────────────────────────────│
-│                                                                                │
-│     Staging BRAM  ·  8 slots × 16 words × 32 bit                               │
-│      Port A (write) ◀── PT FU, one word per pkt_w                              │
-│      Port B (read)  ──▶ drain FSM (IDLE → SEND → IDLE on pkt_s)                │
-│                                       │                                        │
-│                                       ▼                                        │
-│                          AXI-Stream master (m_axis_pkt_tx_*)                   │
-│                          1 × 32-bit beat per cycle  ──▶ order frame            │
+└────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────┐
+│ ┌───────────────────────────────────────────────────────────────────────────┐  │
+│ │           FETCH  →  DECODE  →  RENAME  →  DISPATCH  ·  ROB (32)           │  │
+│ └──┬────┬────┬────┬────┬───────────────────────┬──────────┬─────────────────┘  │
+│    │    │    │    │    │                       │          │                    │
+│    ▼    ▼    ▼    ▼    ▼                       ▼          ▼                    │
+│  ┌───┐┌───┐┌───┐┌───┐┌───┐              ┏━━━━━━━━━┓ ┏━━━━━━━━━━━━┓             │
+│  │ALU││BR ││MUL││DIV││MEM│   inherited  ┃fetch_   ┃ ┃ pkt_tx_rs  ┃             │
+│  │RS ││RS ││RS ││RS ││RS │     core     ┃trade RS ┃ ┃            ┃             │
+│  └─┬─┘└─┬─┘└─┬─┘└─┬─┘└─┬─┘              ┗━━━━┯━━━━┛ ┗━━━━━┯━━━━━━┛             │
+│    ▼    ▼    ▼    ▼    ▼                     ▼            ▼                    │
+│  ┌───┐┌───┐┌───┐┌───┐┌───┐              ┏━━━━━━━━━┓ ┏━━━━━━━━━┓                │
+│  │ALU││BR ││MUL││DIV││MEM│              ┃fetch_   ┃ ┃ pkt_tx  ┃                │
+│  │FU ││FU ││FU ││FU ││FU │              ┃trade FU ┃ ┃   FU    ┃                │
+│  └─┬─┘└─┬─┘└─┬─┘└─┬─┘└─┬─┘              ┃┌───────┐┃ ┃┌───────┐┃                │
+│    │    │    │    │    │                ┃│RX FIFO│┃ ┃│   TX  │┃                │
+│    │    │    │    │    │ ──from parser──╋┤  BRAM │┃ ┃│  BRAM │╋► m_axis_pkt_tx │
+│    │    │    │    │    │   (writes RX)  ┃└───────┘┃ ┃└───────┘┃    AXI-Stream  │
+│    │    │    │    │    │                ┗━━━━┯━━━━┛ ┗━━━━━┯━━━┛                │
+│    ▼    ▼    ▼    ▼    ▼                     ▼            ▼                    │
+│ ═══════════════════════════════════════════════════════════════════════════════│
+│   cdb_alu_br          cdb_mul_div  (shared: MUL · DIV · fetch_trade · pkt_tx)  │
+│                                       cdb_mem                                  │
+│ ═══════════════════════════════════════════════════════════════════════════════│
+│                                    │                                           │
+│                                    ▼                                           │
+│                PRF (64 physical regs)  ·  ROB commits in program order         │
 └────────────────────────────────────────────────────────────────────────────────┘
 
 ```
