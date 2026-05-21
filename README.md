@@ -154,21 +154,6 @@ Wire ──┼─▶│ 100 G  │───▶│ ITCH     │──▶│ BAR2 
 
 The FPGA side is validated on real silicon (Xilinx U55C, PCIe-attached). The CPU side is validated via cycle-accurate simulation in Synopsys VCS.
 
-### 1.3 Headline results
-
-| Metric | Value | Where measured |
-|---|---|---|
-| `fetch_trade` single-shot speedup vs MMIO | **1.78×** | VCS sim (`itch_custom` vs `itch_mmio`) |
-| Steady-state speedup vs MMIO | 1.12× | VCS sim (1000-iteration loop) |
-| End-to-end tick-to-trade latency | **94 cycles** | VCS sim, `itch_tick_to_trade` |
-| Equivalent wall-clock @ 322 MHz | ≈ 290 ns | derived |
-| Equivalent wall-clock @ 200 MHz | ≈ 470 ns | derived |
-| Peak measured TX throughput | **5.66 Gbps** | VCS sim, `itch_max_throughput` @ 322 MHz |
-| Theoretical TX drain ceiling | 10.3 Gbps | derived from 16-beat drain limit |
-| FPGA parser end-to-end | **all fields correct** | U55C silicon, see §10 |
-
----
-
 ## 2. Repository Structure
 
 ```
